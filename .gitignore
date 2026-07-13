@@ -1,0 +1,12 @@
+# ROS2 colcon build artifacts
+/build/
+/install/
+/log/
+
+# Runtime data logs
+/log_csv/
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,22 @@
+[Unit]
+Description=Fish Robot ROS2 (fish_robot_pkg launch)
+# 하드웨어(UART/I2C)가 올라온 뒤 시작
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+User=fish
+Group=fish
+WorkingDirectory=/home/fish/ros2_ws
+# ROS 환경 + 워크스페이스 오버레이 source 후 launch 실행
+ExecStart=/bin/bash -c 'source /opt/ros/jazzy/setup.bash && source /home/fish/ros2_ws/install/setup.bash && exec ros2 launch fish_robot_pkg fish_robot.launch.py'
+# 노드 개별 respawn은 launch가 처리하고, 런처 자체가 죽으면 systemd가 살림
+Restart=on-failure
+RestartSec=5
+# 로그를 journald로
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
