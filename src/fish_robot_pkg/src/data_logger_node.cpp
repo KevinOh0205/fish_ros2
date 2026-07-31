@@ -1,3 +1,25 @@
+// =============================================================================
+//  data_logger_node.cpp
+//
+//  역할 : 시스템 전 토픽을 한 곳에서 구독해 100Hz로 CSV 한 줄씩 기록하는 블랙박스
+//
+//   [입력] /filtered/attitude          (Vector3)             자세 + 모드 플래그
+//          /sensor/pressure_calibrated (Float32MultiArray[3]) 영점 보정된 압력
+//          /sensor/pressure_raw        (Float32MultiArray[6]) 원시 온도([3..5])만 사용
+//          /rc/command                 (Quaternion)          조종기 스틱
+//          /rc/status                  (Int32MultiArray[5])  버튼/배터리/RSSI
+//          /motor/output               (UInt16MultiArray[4]) 최종 모터 출력
+//          /sensor/tail_rpm            (Int32)               꼬리 RPM
+//   [출력] ~/ros2_ws/log_csv/fish_log_YYYYMMDD_HHMMSS.csv
+//
+//  설계 : 콜백은 값을 멤버 변수에 "저장만" 하고, 10ms 타이머가 그 순간의
+//         최신 스냅샷을 한 줄로 기록한다. 토픽마다 주기가 달라도(압력 11Hz,
+//         자세 100Hz) 시간축이 일정한 표가 만들어진다.
+//
+//  ※ 파일이 무한히 커진다. 100Hz x 23컬럼이면 대략 시간당 40MB 수준이고,
+//     장시간 운용 로그가 GB 단위까지 자란 사례가 있다. 회전(rotation) 없음.
+// =============================================================================
+
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
@@ -31,10 +53,11 @@ public:
         btn1_long_processed_ = false;
         is_auto_mode_ = false;
 
+        // 각 컬럼의 초기값. 해당 센서가 아직 안 붙은 구간은 이 값이 그대로 기록된다.
         mode_ = 0;
         roll_ = 0.0f; pitch_ = 0.0f; yaw_ = 0.0f;
         rc_t_ = 0; rc_r_ = 0; rc_p_ = 0; rc_y_ = 0;
-        m1_ = 1500; m2_ = 1500; m3_ = 1500; m4_ = 1000;
+        m1_ = 1500; m2_ = 1500; m3_ = 1500; m4_ = 1000;   // 서보 중립 + 추진 정지
         rpm_ = 0;
         p0_cal_ = 0.0f; p1_cal_ = 0.0f; p2_cal_ = 0.0f;
         t0_ = 0.0f; t1_ = 0.0f; t2_ = 0.0f;
@@ -66,11 +89,13 @@ public:
         rpm_sub_ = this->create_subscription<std_msgs::msg::Int32>(
             "/sensor/tail_rpm", 10, std::bind(&DataLoggerNode::rpm_callback, this, std::placeholders::_1));
 
+        // 100Hz 기록 타이머 (모든 토픽의 최신 스냅샷을 한 줄로)
         logging_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(10), std::bind(&DataLoggerNode::write_log_loop, this));
     }
 
     ~DataLoggerNode() {
+        // 소멸 시 버퍼에 남은 마지막 몇 줄까지 디스크에 확실히 내려쓴다.
         if (fp_ != nullptr) {
             fflush(fp_);
             fclose(fp_);
@@ -83,14 +108,16 @@ private:
         const char* log_dir_path = "/home/fish/ros2_ws/log_csv";
         struct stat st;
         memset(&st, 0, sizeof(struct stat));
-        
+
+        // 디렉터리가 없으면 생성
         if (stat(log_dir_path, &st) == -1) {
             if (mkdir(log_dir_path, 0775) < 0) return -1;
         }
 
+        // 파일명에 기동 시각을 박아 실행마다 새 파일이 생기게 한다 (덮어쓰기 사고 방지)
         time_t t = time(nullptr);
         struct tm tm_info;
-        localtime_r(&t, &tm_info);
+        localtime_r(&t, &tm_info);   // _r 버전: 스레드 안전
 
         char file_path[512];
         snprintf(file_path, sizeof(file_path), "%s/fish_log_%04d%02d%02d_%02d%02d%02d.csv",
@@ -101,13 +128,22 @@ private:
         if (fp_ == nullptr) return -1;
 
         fprintf(fp_, "Time(s),Btn1_Count,Mode,AutoMode,Roll,Pitch,Yaw,RC_T,RC_R,RC_P,RC_Y,M1,M2,M3,M4,RPM,P0_cal,P1_cal,P2_cal,T0,T1,T2,RSSI\n");
-        fflush(fp_);
-        
+        fflush(fp_);   // 헤더는 즉시 기록해 파일이 비어 보이지 않게 한다
+
         return 0;
     }
 
+    // 각 센서가 처음 붙는 시점을 로그 시간축 기준으로 남긴다. 로깅이 기동 즉시
+    // 시작되므로, 초기값 구간과 실제 데이터 구간의 경계를 이걸로 찾을 수 있다.
+    void note_first_arrival(bool &flag, const char *what) {
+        if (flag) return;
+        flag = true;
+        double t = is_logging_active_ ? (this->now() - start_time_).seconds() : 0.0;
+        RCLCPP_INFO(this->get_logger(), "[Data Logger] %s 수신 시작 (t = %.3f초).", what, t);
+    }
+
     void attitude_callback(const geometry_msgs::msg::Vector3::SharedPtr msg) {
-        received_attitude_ = true;
+        note_first_arrival(received_attitude_, "자세(attitude)");
         // state_estimation이 자동 모드 표시용으로 roll에 실은 ±5000 오프셋을 제거해
         // 실제 자세각을 기록한다 (pid_control_node의 디코딩과 동일 규칙).
         // 동시에 이 오프셋을 로봇의 실제 모드(단일 출처)로 사용한다.
@@ -127,7 +163,7 @@ private:
 
     void pressure_cal_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
         if (msg->data.size() < 3) return;
-        received_pressure_ = true;
+        note_first_arrival(received_pressure_, "보정 압력(pressure_calibrated)");
         p0_cal_ = msg->data[0];
         p1_cal_ = msg->data[1];
         p2_cal_ = msg->data[2];
@@ -141,6 +177,8 @@ private:
         t2_ = msg->data[5];
     }
 
+    // 조종기 스틱 값. -9999(두절 센티넬)도 걸러내지 않고 그대로 기록해
+    // 나중에 로그에서 두절 구간을 눈으로 찾을 수 있게 한다.
     void rc_cmd_callback(const geometry_msgs::msg::Quaternion::SharedPtr msg) {
         rc_r_ = static_cast<int16_t>(msg->x);
         rc_p_ = static_cast<int16_t>(msg->y);
@@ -160,9 +198,11 @@ private:
         // 짧은 누름(Edge Detection)으로 버튼 누적 카운트만 집계한다.
         // 자동/수동 모드 판정은 여기서 하지 않고 state_estimation이 방송한
         // /filtered/attitude 오프셋(attitude_callback)을 단일 출처로 사용한다.
+        //
+        // /rc/status는 100Hz로 오므로 카운터 1틱 = 10ms다.
         if (current_btn1 == 1) {
             btn1_hold_counter_++;
-            if (btn1_hold_counter_ == 300) {
+            if (btn1_hold_counter_ == 300) {   // 3초 이상 = 롱프레스 -> 짧은 누름 집계에서 제외
                 btn1_long_processed_ = true;
             }
         } else {
@@ -170,6 +210,7 @@ private:
             // 1→255 전이를 '뗌'으로 오인해 카운트가 증가하는 것을 막는다(N4).
             if (prev_btn1_ == 1 && current_btn1 == 0) {
                 // 손을 떼는 순간(Falling Edge), 30ms 이상 1초 이하로 눌렸을 때만 짧은 누름으로 인정
+                // (하한: 채터링 제거 / 상한: 롱프레스와 구분)
                 if (btn1_hold_counter_ > 3 && btn1_hold_counter_ < 100 && !btn1_long_processed_) {
                     btn1_cumulative_count_++; // 누적 카운트 증가!
                 }
@@ -197,17 +238,18 @@ private:
     }
 
     void write_log_loop() {
+        // 센서 연결 여부와 무관하게 노드 기동 즉시 로깅을 시작한다.
+        // (이전에는 received_attitude_ && received_pressure_ 를 요구했는데, 압력센서를
+        //  물리적으로 떼고 벤치 테스트하면 /sensor/pressure_calibrated가 영원히 발행되지
+        //  않아 CSV에 헤더만 남고 데이터가 0행이었다. 각 센서가 붙기 전 구간은 초기값으로
+        //  기록되며, 실제 수신 시작 시점은 아래 콜백들이 INFO 로그로 남긴다.)
         if (!is_logging_active_) {
-            if (received_attitude_ && received_pressure_) {
-                is_logging_active_ = true;
-                start_time_ = this->now(); 
-                RCLCPP_INFO(this->get_logger(), "=========================================");
-                RCLCPP_INFO(this->get_logger(), "[Data Logger] 센서 0점 보정 완료 감지!");
-                RCLCPP_INFO(this->get_logger(), "[Data Logger] 데이터 로깅을 0.0초부터 시작합니다.");
-                RCLCPP_INFO(this->get_logger(), "=========================================");
-            } else {
-                return; 
-            }
+            is_logging_active_ = true;
+            start_time_ = this->now();   // 이 시각이 Time(s) 컬럼의 0초
+            RCLCPP_INFO(this->get_logger(), "=========================================");
+            RCLCPP_INFO(this->get_logger(), "[Data Logger] 데이터 로깅을 0.0초부터 시작합니다.");
+            RCLCPP_INFO(this->get_logger(), "[Data Logger] (센서 미연결 구간은 초기값으로 기록됩니다)");
+            RCLCPP_INFO(this->get_logger(), "=========================================");
         }
 
         if (fp_ == nullptr) return;
@@ -228,6 +270,9 @@ private:
                 t0_, t1_, t2_,
                 rssi_);
 
+        // 50줄(0.5초)마다 디스크로 강제 플러시.
+        // 매 줄 플러시하면 SD카드 I/O로 100Hz 루프가 밀리고, 아예 안 하면
+        // 전원이 갑자기 끊길 때 마지막 수 초가 통째로 날아간다. 그 절충점.
         static int flush_cnt = 0;
         if (++flush_cnt >= 50) {
             fflush(fp_);
@@ -236,20 +281,21 @@ private:
     }
 
     FILE* fp_;
-    
-    bool received_attitude_;
+
+    bool received_attitude_;    // 최초 수신 로그를 한 번만 찍기 위한 래치
     bool received_pressure_;
     bool is_logging_active_;
-    rclcpp::Time start_time_;
+    rclcpp::Time start_time_;   // Time(s) 컬럼의 기준 시각
 
     // [추가] 버튼 엣지 디텍션 및 상태 관리용 변수들
-    int32_t btn1_cumulative_count_;
-    int btn1_hold_counter_;
-    int prev_btn1_;
-    bool btn1_long_processed_;
+    int32_t btn1_cumulative_count_;   // 짧은 누름 누적 횟수 (CSV Btn1_Count 컬럼)
+    int btn1_hold_counter_;           // 현재 눌림 지속 틱 수 (1틱 = 10ms)
+    int prev_btn1_;                   // 직전 버튼 상태 (엣지 판정용)
+    bool btn1_long_processed_;        // 롱프레스로 이미 처리됨 -> 뗄 때 짧은 누름 집계 안 함
     bool is_auto_mode_;
 
-    int32_t mode_;
+    // ---- 이하가 CSV 한 줄을 구성하는 최신 스냅샷 ----
+    int32_t mode_;                             // 0=정상, 2=조종기 두절
     float roll_, pitch_, yaw_;
     int16_t rc_t_, rc_r_, rc_p_, rc_y_;
     uint16_t m1_, m2_, m3_, m4_;
@@ -271,6 +317,8 @@ private:
 int main(int argc, char **argv) {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<DataLoggerNode>();
+    // 생성자에서 파일 열기에 실패하면 rclcpp::shutdown()이 호출된 상태일 수 있으므로
+    // spin 전에 한 번 확인한다.
     if (rclcpp::ok()) {
         rclcpp::spin(node);
     }
