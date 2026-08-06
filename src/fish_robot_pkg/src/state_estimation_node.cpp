@@ -48,6 +48,7 @@
 
 #include <stdio.h>
 #include <math.h>
+#include <cmath>       // std::isfinite (dt 실측값 검증)
 #include <string.h>
 #include <algorithm>
 #include <fstream>
@@ -78,7 +79,10 @@ class StateEstimationNode : public rclcpp::Node {
 public:
     StateEstimationNode() : Node("state_estimation_node"),
                             // q0~q3 = 자세 쿼터니언, (1,0,0,0)은 "회전 없음" 초기 자세
-                            dt_(0.01f), q0_(1.0f), q1_(0.0f), q2_(0.0f), q3_(0.0f),
+                            dt_(0.01f),
+                            last_imu_time_(0, 0, RCL_ROS_TIME), have_prev_imu_time_(false),
+                            dt_clamp_count_(0),
+                            q0_(1.0f), q1_(0.0f), q2_(0.0f), q3_(0.0f),
                             gyro_calibrated_(false), gyro_sample_count_(0),
                             press_calibrated_(false), press_sample_count_(0),
                             is_mag_calibrating_(false), mag_calib_sample_count_(0), last_progress_(-1),
@@ -95,6 +99,10 @@ public:
                             button_press_start_time_(0, 0, RCL_ROS_TIME),
                             left_btn_pressed_(false),
                             left_btn_press_start_time_(0, 0, RCL_ROS_TIME),
+                            // [수정] 초기화 리스트에 빠져 있어 첫 /rc/status 수신 전까지
+                            // 값이 불확정이었다. 기동 직후 btn1을 누르면 모드 토글이
+                            // 엉뚱하게 발동하거나 씹힐 수 있었다.
+                            btn1_long_processed_(false),
                             btn2_long_processed_(false),
                             last_mag_time_(0, 0, RCL_ROS_TIME),
                             mag_timeout_(std::chrono::milliseconds(500))   // 지자기 500ms 무수신 = 죽은 것으로 간주
@@ -587,6 +595,37 @@ private:
         ch_imu_msg.angular_velocity.z = gz;
         ch_imu_pub_->publish(ch_imu_msg);
 
+        // ---- [수정] 적분 스텝을 실측한다 (기존에는 dt_ = 0.01f 고정) ----
+        // 자세는 "각속도 x 경과시간"의 누적이다. 경과시간을 상수로 박아두면
+        // IMU가 늦게 올 때마다 그만큼 회전을 놓친다. 실제로 /raw/imu_6dof 에
+        // 0.5초 공백이 관측됐고, 그 구간은 10ms로 취급되어 49샘플분 회전이 사라졌다.
+        // 더 흔하고 더 위험한 쪽은 자잘한 유실이다 — 1%가 빠지면 1% 과소적분이
+        // 쉬지 않고 누적되어, 100도/초 선회 중 1도/초씩 계속 모자라게 된다.
+        //
+        // ※ 상한 클램프를 두는 이유 (EKF 노드와 다른 판단):
+        //   Mahony는 게인이 고정(Kp)이라 큰 dt가 그대로 큰 보정 스텝이 된다.
+        //   Kp*dt 가 커지면 오버슈트/진동 위험이 있어 0.1초에서 자른다
+        //   (Kp*dt/2 = 0.1 -> 스텝당 오차의 약 20% 보정, 안정 영역).
+        //   EKF는 공분산이 알아서 신뢰도를 조절하므로 상한을 두지 않았다.
+        //   여기서 잘린 만큼은 여전히 손실이지만, 최소한 로그로 드러난다.
+        rclcpp::Time imu_time(msg->header.stamp);
+        if (imu_time.nanoseconds() == 0) imu_time = this->now();   // 스탬프 미기입 폴백
+        if (have_prev_imu_time_) {
+            const double measured = (imu_time - last_imu_time_).seconds();
+            if (std::isfinite(measured) && measured > 0.0) {
+                if (measured > 0.1) {
+                    dt_clamp_count_++;
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "[System] IMU 공백 %.0f ms (샘플 %.0f개분, 누적 %d회) -> 100ms로 제한하여 적분",
+                        measured * 1000.0, measured / 0.01, dt_clamp_count_);
+                }
+                dt_ = static_cast<float>(std::clamp(measured, 0.001, 0.1));
+            }
+            // measured <= 0 (시계 역행/중복 스탬프)이면 직전 dt_를 그대로 유지한다
+        }
+        last_imu_time_ = imu_time;
+        have_prev_imu_time_ = true;
+
         // ---- [1단계] 자이로 영점 캘리브레이션 (기동 후 약 10초) ----
         // 정지 상태에서도 자이로는 0이 아닌 값을 뱉는다(바이어스). 이 평균을 미리 재서
         // 이후 모든 측정값에서 빼주지 않으면 자세가 한 방향으로 계속 흘러간다.
@@ -646,7 +685,10 @@ private:
         attitude_pub_->publish(attitude_msg);
     }
 
-    float dt_;                              // 고정 적분 스텝(초). 100Hz 고정을 전제로 한 상수
+    float dt_;                              // 적분 스텝(초). imu_callback에서 매 샘플 실측 (0.001~0.1로 제한)
+    rclcpp::Time last_imu_time_;            // dt_ 계산용 직전 IMU 타임스탬프
+    bool  have_prev_imu_time_;              // 첫 샘플 판별 (첫 스텝은 초기값 0.01 사용)
+    int   dt_clamp_count_;                  // 상한(100ms)에 걸린 횟수 — UART 건전성 지표
     float q0_, q1_, q2_, q3_;               // 현재 자세 쿼터니언
     float eInt_[3];                         // Mahony I항 누산기
     float gyro_bias_[3];                    // 자이로 영점(도/초)

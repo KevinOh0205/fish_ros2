@@ -15,6 +15,7 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(Eigen3 3.4 REQUIRED)
 
 find_library(M_LIB m REQUIRED)
 
@@ -67,6 +68,19 @@ add_executable(auto_scenario_node src/auto_scenario_node.cpp)
 ament_target_dependencies(auto_scenario_node rclcpp std_msgs geometry_msgs sensor_msgs)
 target_link_libraries(auto_scenario_node ${M_LIB})
 
+# =================================================================
+# 8. State Estimation EKF Node (신규 - Mahony와 병렬 동작하는 EKF 자세 추정)
+# =================================================================
+# std_srvs를 일부러 뺐다. 이 노드는 서비스를 광고하지 않는다 —
+# /calibrate_mag 를 중복 광고하면 어느 서버가 응답할지 정의되지 않으며,
+# 그 핸들러는 보정 파일을 truncate-write 한다. 의존성을 빼두면
+# std_srvs 를 include 하는 순간 컴파일 에러가 나므로 규칙이 강제된다.
+add_executable(state_estimation_ekf_node src/state_estimation_ekf_node.cpp)
+ament_target_dependencies(state_estimation_ekf_node rclcpp std_msgs geometry_msgs sensor_msgs)
+# ament_target_dependencies 가 plain 시그니처를 쓰므로 여기도 plain 이어야 한다
+# (혼용하면 "The plain signature ... has already been used" 하드 에러).
+target_link_libraries(state_estimation_ekf_node ${M_LIB} Eigen3::Eigen)
+
 install(TARGETS
   uart_bridge_node
   i2c_driver_node
@@ -75,6 +89,7 @@ install(TARGETS
   rpm_driver_node
   data_logger_node
   auto_scenario_node
+  state_estimation_ekf_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

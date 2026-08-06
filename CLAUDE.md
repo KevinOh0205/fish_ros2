@@ -121,7 +121,11 @@ by design, since autonomous running without a transmitter is the normal case.
 whatever `/filtered/attitude` publishes at. The PID also **omits `dt`** — gains absorb it, assuming
 a fixed 100 Hz. If the attitude rate ever changes, the gains are wrong.
 
-Same assumption in `state_estimation_node`: `dt_` is a hard-coded `0.01f`.
+`state_estimation_node` **no longer** shares that assumption: `dt_` is measured per sample from
+`header.stamp`, clamped to `[0.001, 0.1]` s, and a clamp event is logged. The clamp exists because
+Mahony's gain is fixed — a large `dt` becomes a large correction step (`Kp·dt`), so it must be
+bounded. `state_estimation_ekf_node` deliberately has **no** upper clamp; its covariance adjusts the
+trust automatically, so integrating the true `dt` is strictly better there.
 
 ### 6. Startup is not instantaneous
 
@@ -146,9 +150,42 @@ Same assumption in `state_estimation_node`: `dt_` is a hard-coded `0.01f`.
 ### 8. Magnetometer failure is a supported state
 
 If AK8963 doesn't answer for 500 ms, `state_estimation_node` falls back from 9-DOF to 6-DOF Mahony
-automatically. **On this machine the AK8963 is currently not responding, so it always runs 6-DOF.**
-Consequence: roll/pitch are absolutely referenced by gravity and stable, but **yaw has no absolute
-reference and drifts** — measured at roughly −8°/min. Yaw PID chases that drift.
+automatically. **As of 2026-07-31 the AK8963 IS responding (~94 Hz), so the system runs 9-DOF.**
+Measured yaw drift in that state is **+0.04°/min**. The −8°/min figure quoted previously applies only
+to the 6-DOF case (mag dead), where yaw has no absolute reference; do not use it as a 9-DOF baseline.
+
+**But the magnetometer data is contaminated, and 9-DOF Mahony is corrupting roll/pitch because of it.**
+Because `update_9dof_mahony` adds the magnetic error into the *same* correction vector as gravity, a
+bad magnetic vector rotates roll and pitch, not just yaw. Measured at rest 2026-07-31:
+`gravity → roll −1.19 / pitch 3.75`, `Mahony → roll −6.16 / pitch 2.10` (**5.0° / 1.7° off**).
+
+Two symptoms, both measured:
+
+- **Dip angle is physically impossible.** The angle between the FLU magnetic vector and gravity reads
+  **58–60°**; in Korea it must be ~143° (the field points north *and down*). Under 90° means the code
+  thinks the field points *up*.
+- **The field magnitude is wrong and not constant across sessions.** Raw `|m|` (before any calibration)
+  measured 69 µT, against Earth's ~45 µT here — and an earlier session measured 45.4 µT. Between two
+  captures 40 min apart the `y` component moved **28 µT** (60% of Earth's field) while the robot
+  rotated only 1.5°, which rotation cannot explain. Within each capture the sensor is rock stable
+  (σ ≈ 0.8 µT, drift < 0.2 µT over 30 s) and the motors were idle throughout (1500/1500/1500/1000),
+  so this is neither sensor noise nor the robot's own current — **the ambient field changed.**
+
+**Do not conclude from the dip alone that the axis remap is wrong.** With a hard-iron offset this
+large (comparable to Earth's field), the offset by itself can produce any dip value, so dip cannot
+separate "wrong axes" from "wrong hard-iron". What *is* certain: yaw derived from this magnetometer is
+untrustworthy today, and the stored `mag_calib_params.txt` makes it worse (applying it drives `|m|`
+from 69 → 83 µT).
+
+Note for whoever does resolve it: the remap comment at `state_estimation_node.cpp:495-521` derives the
+Z negation from the MPU9250 datasheet's AK8963-vs-MPU6500 die alignment. That derivation is internally
+correct but its **premise is wrong** — accel/gyro come from the **nRF52840's own IMU**, not the
+MPU6500 (which `i2c_driver_node` never wakes or reads; the MPU9250 is only an I²C bypass to reach the
+AK8963). They are physically separate packages and can be mounted differently, so no datasheet die
+alignment can settle it. It needs a tumble test that solves hard/soft-iron **and** the 24 right-handed
+axis permutations together, from one dataset. And since the ambient field is not stable, any result is
+valid only for that place and configuration. `state_estimation_ekf_node` logs a loud startup ERROR
+when the dip is physically impossible.
 
 Calibration coefficients load from `~/ros2_ws/log_csv/mag_calib_params.txt` (note: the `mag_calib.txt`
 at the workspace root is **not** read by any code). Trigger calibration with a btn2 long press or:
@@ -171,16 +208,38 @@ explicitly reject non-0/1 values so the `1 → 255` transition isn't misread as 
 
 ## Known gaps
 
-- **No IMU axis transform.** The sensor frame and the filter's expected frame are not aligned, and
-  `state_estimation_node` passes accel/gyro straight through. Correcting this means inserting a
-  rotation right after `imu_callback` reads the message (`state_estimation_node.cpp:484`), applied to
-  **both** accel and gyro. Verify any candidate rotation with `det(R) = +1` and `R·Rᵀ = I`.
+- **Magnetometer data is contaminated** — see §8. Highest-priority open defect; it puts a 5° error
+  into Mahony's roll today. Cause not yet isolated between axis remap and hard iron; needs a tumble
+  test that solves both together, not a guess.
+- **The IMU axis transform is verified for the accelerometer only** (`state_estimation_node.cpp:575-580`,
+  `R = [0 0 −1; −1 0 0; 0 1 0]`, `det = +1`). Tilt cross-axis test, 2026-08-04, two runs: the physical
+  rotation axis sits **0.01°** from where the non-level baseline predicts, and both signs check out
+  (nose up → pitch negative; port side up → roll positive). What that test **cannot** cover: gravity is
+  blind to yaw, so the **yaw axis and the whole gyro path remain unverified** — that needs a yaw
+  rotation test, not a tilt.
+  Two things to know before reading a tilt result: (a) the mounting baseline is **pitch ≈ 7.9°**, not
+  level, and rotating about a world-horizontal axis from a tilted start moves the Euler *other* angle by
+  ~2° at 45° — a geometric artifact, not an axis error; (b) a wrong axis transform is a rotation, and
+  rotations preserve angles, so it can **never** change the measured sweep angle. A sweep that reads
+  short means the sensor is not turning with the hull (mounting), or the applied angle was misjudged.
+  **The sensor does track the hull** — 90° test 2026-08-06: laid on its side → 87.1°, stood on its tail
+  → 94.8°, against 3.3° repeatability in re-placing it level. Any scale factor able to turn 45° into 29°
+  would have read 90° as 58°. Hand-judged tilt angles are worth ±15°; trust the sweep number instead.
+  Note the Euler readout **is** degenerate near pitch ±90 — during that nose-up hold the reported roll
+  wandered 20° while the true attitude moved 0.9°. Judge stillness on the gravity vector, never on
+  Euler angles.
 - **Positive pitch = nose DOWN** in this code's Euler convention (opposite of aerospace convention).
-  Confirm sign expectations before touching the pitch PID or the AUTO scenario.
+  Confirmed by measurement 2026-08-04. Confirm sign expectations before touching the pitch PID or the
+  AUTO scenario.
+- **Accelerometer axes have a ~2% scale/bias asymmetry**: static `|a|` moves 0.986 → 1.009 g across
+  attitudes. Bounds the attitude error at **≤0.6°**, and both filters normalise the accel so it barely
+  touches attitude — but it does shift the EKF's `a_ref_` gate. Fitting it needs a tumble (3 attitudes
+  cannot determine 6 parameters — the same underdetermination as the magnetometer hard iron), so
+  capture accel alongside mag when the tumble finally happens and solve both from one dataset.
 - **Roll/pitch have no offset calibration** analogous to `yaw_offset_`, so a non-level mounting shows
   up as permanent nonzero attitude.
-- `state_estimation_node.cpp`: `btn1_long_processed_` is declared and used but missing from the
-  constructor initializer list — indeterminate until the first `/rc/status` with `btn1 == 0` clears it.
+- `state_estimation_node.cpp`: `btn1_long_processed_` was missing from the constructor initializer
+  list (indeterminate until the first `/rc/status` with `btn1 == 0` cleared it) — **fixed 2026-07-31**.
   Several members (`right_btn_pressed_`, `left_btn_pressed_`, `button_press_start_time_`,
   `left_btn_press_start_time_`, `last_progress_`, `dynamic_pressures_`) are initialized or assigned
   but never read — leftovers from an earlier button implementation.
