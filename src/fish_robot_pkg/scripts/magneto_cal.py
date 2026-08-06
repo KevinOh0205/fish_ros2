@@ -10,11 +10,11 @@
 붙어 있는 것**이라 장소를 따라가지 않는다. 반대로 부품을 붙이거나 떼면 무효다.
 
 사용:
-    python3 magneto_cal.py                     # 수집 -> 피팅 -> 파일 저장
-    python3 magneto_cal.py --no-write          # 저장 없이 결과만
-    python3 magneto_cal.py --csv <파일>        # 이전에 모은 데이터로 다시 계산 (로봇 불필요)
-    python3 magneto_cal.py --search-axes       # 축 재배치 24가지를 전부 시험
-    python3 magneto_cal.py --dip 143           # 그 지역의 복각 (기본값 한국 143도)
+    ros2 run fish_robot_pkg magneto_cal.py                     # 수집 -> 피팅 -> 파일 저장
+    ros2 run fish_robot_pkg magneto_cal.py --no-write          # 저장 없이 결과만
+    ros2 run fish_robot_pkg magneto_cal.py --csv <파일>        # 이전에 모은 데이터로 다시 계산 (로봇 불필요)
+    ros2 run fish_robot_pkg magneto_cal.py --search-axes       # 축 재배치 24가지를 전부 시험
+    ros2 run fish_robot_pkg magneto_cal.py --dip 143           # 그 지역의 복각 (기본값 한국 143도)
 
 축 재배치를 모르는 새 하드웨어라면 --search-axes 를 쓴다. 복각(자기장과 중력 사이 각)은
 그 지역에서 물리적으로 정해진 값이라, 24가지 오른손 좌표계 후보 중 그 값을 내는 것이

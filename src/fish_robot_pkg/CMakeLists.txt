@@ -97,4 +97,13 @@ install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )
 
+# 개발 도구 (로봇에 상주하지 않는다. 지자기 보정과 그 검증용)
+#   ros2 run fish_robot_pkg magneto_cal.py
+#   ros2 run fish_robot_pkg verify_spin.py
+install(PROGRAMS
+  scripts/magneto_cal.py
+  scripts/verify_spin.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()

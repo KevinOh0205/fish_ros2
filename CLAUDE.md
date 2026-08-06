@@ -215,7 +215,7 @@ Two method traps, both hit on 2026-08-06:
   (σ 0.68 → 2.64) *in the phase after the load* — consistent with heat reaching the sensor rather than
   current. 3 µT ≈ 8° of heading, which may cap achievable accuracy. See the load test below.
 
-#### End-to-end heading — PASSED 2026-08-06 (360° spin, `src/magneto_cal/verify_spin.py`)
+#### End-to-end heading — PASSED 2026-08-06 (360° spin, `scripts/verify_spin.py`)
 
 One 66 s hand-held level turn, gyro-about-gravity as truth (that axis was itself verified to +359.96°).
 

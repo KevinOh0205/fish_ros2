@@ -1,7 +1,8 @@
 # magneto_cal — 지자기 보정 도구
 
 물고기 로봇의 지자기(AK8963) 하드아이언·소프트아이언을 텀블 + 타원체 피팅으로 구한다.
-`fish_robot_pkg` 와 독립된 스크립트다. `COLCON_IGNORE` 가 있어 `colcon build` 에 잡히지 않는다.
+`fish_robot_pkg` 패키지의 개발 도구다. 로봇에 상주하지 않고, 토픽만 구독하므로
+systemd 서비스가 도는 채로 그대로 실행된다.
 
 ## 왜 따로 만들었나
 
@@ -23,7 +24,7 @@
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-python3 src/magneto_cal/magneto_cal.py
+ros2 run fish_robot_pkg magneto_cal.py
 ```
 
 화면의 여섯 자세를 하나씩 잡고, **그 자세 그대로 제자리에서 한 바퀴** 돈다.
@@ -105,7 +106,7 @@ python3 src/magneto_cal/magneto_cal.py
 따라가지 않으면 쓸 수 없다.
 
 ```bash
-python3 src/magneto_cal/verify_spin.py 60
+ros2 run fish_robot_pkg verify_spin.py 60
 ```
 
 처음 6초 정지(자이로 바이어스 측정), 그 다음 수평으로 들고 제자리에서 한두 바퀴. 정답 기준은
