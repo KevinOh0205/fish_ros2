@@ -195,8 +195,15 @@ private:
             float halfvx = q1_ * q3_ - q0_ * q2_;
             float halfvy = q0_ * q1_ + q2_ * q3_;
             float halfvz = q0q0 - 0.5f + q3q3;
+            // halfw = R^T * (bx, 0, bz) / 2. 각 성분은 회전행렬의 해당 열에서 온다.
+            //   x <- (R00, R20) , y <- (R01, R21) , z <- (R02, R22)
+            // [수정 2026-08-06] halfwy의 bz 계수가 R22(0.5-q1q1-q3q3)로 잘못 적혀 있었다.
+            //   R21 = q0q1+q2q3 (= halfvy) 이 맞다. 단위 쿼터니언으로 검산하면 halfwy는
+            //   0이어야 하는데 옛 식은 0.5*bz를 내놓는다. 지자기 보정이 엉망일 때는 bz가
+            //   작아서 증상이 작았고(기울기 오차 5도), 복각이 제대로 잡히자 bz가 5배로
+            //   커지면서 14도까지 벌어졌다. 보정이 좋아질수록 더 아파지는 종류의 버그다.
             float halfwx = bx * (0.5f - q2q2 - q3q3) + bz * (q1_ * q3_ - q0_ * q2_);
-            float halfwy = bx * (q1_ * q2_ - q0_ * q3_) + bz * (0.5f - q1q1 - q3q3);
+            float halfwy = bx * (q1_ * q2_ - q0_ * q3_) + bz * (q0_ * q1_ + q2_ * q3_);
             float halfwz = bx * (q0_ * q2_ + q1_ * q3_) + bz * (0.5f - q1q1 - q2q2);
 
             // 오차 = (측정 방향) x (예측 방향). 외적이므로 두 방향이 일치하면 0이 된다.
