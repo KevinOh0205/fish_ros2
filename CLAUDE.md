@@ -154,41 +154,126 @@ automatically. **As of 2026-07-31 the AK8963 IS responding (~94 Hz), so the syst
 Measured yaw drift in that state is **+0.04°/min**. The −8°/min figure quoted previously applies only
 to the 6-DOF case (mag dead), where yaw has no absolute reference; do not use it as a 9-DOF baseline.
 
-**But the magnetometer data is contaminated, and 9-DOF Mahony is corrupting roll/pitch because of it.**
-Because `update_9dof_mahony` adds the magnetic error into the *same* correction vector as gravity, a
-bad magnetic vector rotates roll and pitch, not just yaw. Measured at rest 2026-07-31:
-`gravity → roll −1.19 / pitch 3.75`, `Mahony → roll −6.16 / pitch 2.10` (**5.0° / 1.7° off**).
+**A bad magnetic vector corrupts roll/pitch, not just yaw** — `update_9dof_mahony` adds the magnetic
+error into the *same* correction vector as gravity. Measured at rest 2026-07-31 with the old
+calibration: `gravity → roll −1.19 / pitch 3.75` vs `Mahony → roll −6.16 / pitch 2.10` (**5.0° / 1.7°
+off**). This is why the calibration below matters to the *control* loop and not just to heading. The
+EKF does not share the flaw: its magnetometer update is a 1-D horizontal yaw projection
+(`H_m = [ĝ_bᵀ 0]`), so it is structurally incapable of moving roll/pitch.
 
-Two symptoms, both measured:
+#### The axis remap is CORRECT — settled 2026-08-06 by a tumble, do not reopen it
 
-- **Dip angle is physically impossible.** The angle between the FLU magnetic vector and gravity reads
-  **58–60°**; in Korea it must be ~143° (the field points north *and down*). Under 90° means the code
-  thinks the field points *up*.
-- **The field magnitude is wrong and not constant across sessions.** Raw `|m|` (before any calibration)
-  measured 69 µT, against Earth's ~45 µT here — and an earlier session measured 45.4 µT. Between two
-  captures 40 min apart the `y` component moved **28 µT** (60% of Earth's field) while the robot
-  rotated only 1.5°, which rotation cannot explain. Within each capture the sensor is rock stable
-  (σ ≈ 0.8 µT, drift < 0.2 µT over 30 s) and the motors were idle throughout (1500/1500/1500/1000),
-  so this is neither sensor noise nor the robot's own current — **the ambient field changed.**
+`(my, mx, −mz)` at `state_estimation_node.cpp:495-521` is **verified**. A 1164-point tumble (all 8
+octants covered) fitted an axis-aligned ellipsoid; after correction the **dip reads 144.3° ± 3.2°
+against Korea's 143°**. Dip is the angle between the field and gravity — it can only come out right if
+the hard iron *and* all three magnetometer axes are right, so this closes both questions at once.
 
-**Do not conclude from the dip alone that the axis remap is wrong.** With a hard-iron offset this
-large (comparable to Earth's field), the offset by itself can produce any dip value, so dip cannot
-separate "wrong axes" from "wrong hard-iron". What *is* certain: yaw derived from this magnetometer is
-untrustworthy today, and the stored `mag_calib_params.txt` makes it worse (applying it drives `|m|`
-from 69 → 83 µT).
+That the remap's stated *derivation* is bogus remains true and does not matter: the comment derives the
+Z negation from the MPU9250 datasheet's AK8963-vs-MPU6500 die alignment, but accel/gyro come from the
+**nRF52840's own IMU**, not the MPU6500 (which `i2c_driver_node` never wakes; the MPU9250 is only an
+I²C bypass to reach the AK8963). Right answer, wrong reason. Measurement settled it.
 
-Note for whoever does resolve it: the remap comment at `state_estimation_node.cpp:495-521` derives the
-Z negation from the MPU9250 datasheet's AK8963-vs-MPU6500 die alignment. That derivation is internally
-correct but its **premise is wrong** — accel/gyro come from the **nRF52840's own IMU**, not the
-MPU6500 (which `i2c_driver_node` never wakes or reads; the MPU9250 is only an I²C bypass to reach the
-AK8963). They are physically separate packages and can be mounted differently, so no datasheet die
-alignment can settle it. It needs a tumble test that solves hard/soft-iron **and** the 24 right-handed
-axis permutations together, from one dataset. And since the ambient field is not stable, any result is
-valid only for that place and configuration. `state_estimation_ekf_node` logs a loud startup ERROR
-when the dip is physically impossible.
+**This result is permanent** — chip axes do not change when the robot is assembled or moved. The
+*numbers* below are not.
 
-Calibration coefficients load from `~/ros2_ws/log_csv/mag_calib_params.txt` (note: the `mag_calib.txt`
-at the workspace root is **not** read by any code). Trigger calibration with a btn2 long press or:
+#### What the tumble measured
+
+All four candidate calibrations, scored on the same tumble dataset (dip over stationary samples only):
+
+| | \|m\| | scatter | dip (143° = correct) |
+|---|---|---|---|
+| no calibration | 94.4 ± 20.9 µT | 22.1 % | 94.7 ± 51.0° |
+| previous session's file | 90.7 ± 19.2 µT | 21.1 % | 101.9 ± 39.3° |
+| **btn2 min/max, taken the same day in the same configuration** | 45.9 ± 17.5 µT | **38.1 %** | 124.7 ± 24.1° |
+| **tumble + ellipsoid fit** | 34.7 ± 1.5 µT | **4.3 %** | **144.5 ± 2.9°** |
+
+Hard iron is **93.6 µT total, dominated by chip Z (−89.8)** — nearly three times Earth's field here.
+A flat spin can only see the horizontal part (37.8 µT) and is therefore **structurally unable** to
+find this; the earlier "37.8 µT" figure was never the whole offset. Never calibrate from a flat spin.
+
+Two method traps, both hit on 2026-08-06:
+
+- **`min/max` — what btn2 and `/calibrate_mag` do — is worse than no calibration at all.** Not a
+  hypothesis: btn2 was run on 2026-08-06 18:29 in this exact configuration and scored **38.1 %
+  scatter against 22.1 % for doing nothing** (row 3 above). It takes two extremes per axis, so any
+  hand tumble that misses a true extreme puts the midpoint in the wrong place, and the resulting
+  soft-iron scales (0.953/0.953/1.108) then actively distort a field that was at least self-consistent
+  before. Use an ellipsoid fit over all points — `tumble.py` in the session scratchpad.
+  **Every btn2 long press silently overwrites `mag_calib_params.txt`**, so a stray 3 s press can undo
+  a good calibration without any obvious symptom until yaw misbehaves.
+- **Center the data before fitting the quadric.** `a·x²+…=1` on raw values fails outright (returns
+  negative radii) because the cloud sits ~65 µT off the origin, so the squared terms are nearly
+  collinear. Subtract the mean, fit, add it back.
+
+#### What is still open
+
+- **Field magnitude is 30 % low**: 34.7 µT after correction against Korea's ~50 µT. Direction is
+  right, so heading and attitude are unaffected — but a real scale error would also mean the AK8963
+  ASA sensitivity ROM may not be applied anywhere in `i2c_driver_node`. Unverified.
+- ~~End-to-end heading~~ — **CLOSED 2026-08-06 by the 360° spin.** See the sub-section below.
+- **Thermal drift, unresolved.** After a 4-core CPU load the field moved 3 µT and its noise tripled
+  (σ 0.68 → 2.64) *in the phase after the load* — consistent with heat reaching the sensor rather than
+  current. 3 µT ≈ 8° of heading, which may cap achievable accuracy. See the load test below.
+
+#### End-to-end heading — PASSED 2026-08-06 (360° spin, `src/magneto_cal/verify_spin.py`)
+
+One 66 s hand-held level turn, gyro-about-gravity as truth (that axis was itself verified to +359.96°).
+
+| | sweep | ratio | backtracking (0.5 s smoothed) |
+|---|---|---|---|
+| physical (gyro) | −357.74° | — | — |
+| **calibrated mag** | **−361.79°** | **1.01** | **7.7°** |
+| uncalibrated mag | −1.55° | 0.00 | 102.0° |
+| Mahony yaw | −359.54° | 1.01 | 0.0° |
+
+Total sweep alone proves nothing — check the **per-45° segments**. Calibrated: 38–52°, all near 45.
+Uncalibrated: 12–19° per segment, then **−45.1°** in 270–315° — it runs slow and then reverses. That
+reversal, not the total, is what made the old heading unusable.
+
+**Score backtracking on smoothed data.** At 100 Hz and 33 °/s the true step is 0.33°/sample, well under
+the mag noise, so per-sample sign flips are noise: raw scoring returns >3500° for *every* series
+including the good one.
+
+Residual against the gyro: **median 2.22°, 95 %ile 5.87°, σ 3.10°** — and it is a **single sine cycle
+per revolution, amplitude 3.58°**, which is the signature of leftover hard iron. Back-solving gives
+**1.34 µT horizontal**, matching the ellipsoid fit's own 1.5 µT residual. So the remaining error is the
+known calibration residual showing up exactly as predicted, not a new fault; removing that one cycle
+leaves 2.08°. The lone 18.1° excursion is a momentary spike at −3 °/s (10 of 6601 samples exceed 10°).
+
+`|m|` scatter while turning was **2.5 %**, better than the tumble's 4.3 % — a level spin is the easy
+case, but it confirms the calibration does not fall apart with attitude.
+
+**Subtract the gyro bias before using the gyro as truth.** It was **−2.2 °/s** in this session (see the
+gyro-bias gap below), i.e. 66° of phantom rotation per 30 s. `verify_spin.py` measures it from a 6 s
+stationary window first, the same thing `state_estimation_node` does at boot.
+
+#### The Pi is not the cause (measured 2026-08-06)
+
+40 s idle → 40 s 4-core 100 % → 40 s idle, robot stationary to 0.07°. Load confirmed (1647 → 2400 MHz,
+65.3 → 75.9 °C). Field moved **2.15 µT, only 1.05 µT of it horizontal (≈2.7° of heading)** — about 5 %
+of the contamination. **The offset is essentially constant, which is why calibrating it works at all.**
+
+#### Calibration is tied to the ASSEMBLY, not the place
+
+Hard/soft iron are body-fixed, so a calibration travels to the pool unchanged. An environment-fixed
+external field does **not** shift the fitted center — in the body frame it rotates with the robot like
+Earth's own field, changing only the radius. So:
+
+- **Adding or removing any part invalidates the numbers.** The current file was taken with the robot
+  **stripped to the IMU alone** and must be redone after final assembly.
+- Tumble in one spot, ≥1 m from steel furniture. Carrying the robot around while tumbling walks it
+  through a changing external field and corrupts the fit.
+
+Coefficients load from `~/ros2_ws/log_csv/mag_calib_params.txt` — **read once at node startup**, so
+editing it requires a restart. (The `mag_calib.txt` at the workspace root is **not** read by any code.)
+Current contents, written 2026-08-06 from the tumble; the previous file is kept as `.bak_20260806_194340`:
+
+```
+-12.2555 23.5024 -89.7587      # hard iron, chip axes
+1.046 0.983502 0.973518        # soft iron scale
+```
+
+The built-in triggers still use the inferior min/max method — prefer `tumble.py`:
 
 ```bash
 ros2 service call /calibrate_mag std_srvs/srv/Trigger    # call twice: start, then finish
@@ -208,9 +293,14 @@ explicitly reject non-0/1 values so the `1 → 255` transition isn't misread as 
 
 ## Known gaps
 
-- **Magnetometer data is contaminated** — see §8. Highest-priority open defect; it puts a 5° error
-  into Mahony's roll today. Cause not yet isolated between axis remap and hard iron; needs a tumble
-  test that solves both together, not a guess.
+- **Magnetometer — the axis question is CLOSED, the calibration is provisional** (2026-08-06, §8).
+  The tumble confirmed `(my, mx, −mz)` (dip 144.3° vs 143°) and cut sphericity 22.1 % → 4.3 %; that
+  axis result is permanent. But the coefficients now on disk were taken with the robot **stripped to
+  the IMU alone** and must be redone after final assembly. Until then, restart
+  `state_estimation_node` to pick up the new file (it reads it once at startup) — the old file was
+  worse than none and is what put the 5° error into Mahony's roll. **End-to-end heading now passes**
+  (360° spin, ratio 1.01, residual median 2.2°, §8) — so the coefficients are good *for this
+  configuration*; what stays provisional is only that the configuration will change on assembly.
 - **The IMU axis transform is verified end to end** (`state_estimation_node.cpp:575-580`,
   `R = [0 0 −1; −1 0 0; 0 1 0]`, `det = +1`) — accelerometer and gyro, all three axes, signs included.
   Accel, tilt cross-axis test 2026-08-04 (two runs): the physical rotation axis sits **0.01°** from
@@ -244,14 +334,59 @@ explicitly reject non-0/1 values so the `1 → 255` transition isn't misread as 
   ever **grow** — nothing observes yaw, so shrinking is proof of a leak (measured 40°→7° before the fix,
   60°→61° after). Do **not** pass `null_dir` to the magnetometer update (yaw is the only thing it
   observes) or to the bias pseudo-measurement (a stationary average genuinely measures all three axes).
+- **`update_9dof_mahony` had a wrong rotation-matrix element — fixed 2026-08-06**
+  (`state_estimation_node.cpp:199`). `halfwy`'s `bz` coefficient was `0.5 − q1q1 − q3q3` (that is
+  `R22`); the correct term is `q0q1 + q2q3` (`R21`, and identically `halfvy`). Check it at identity:
+  the predicted field's y component must be 0, but the old expression returned `0.5·bz`.
+  **The symptom scaled with how *good* the magnetometer calibration was** — with the dip wrong at
+  ~100° `bz` was small and tilt error sat at 5.0°; once the tumble put the dip at 144° `bz` grew ~5×
+  and the error jumped to **14.0°**. A latent bug that gets worse as you fix something else. After the
+  fix, 6.8°. Never read "recalibration made attitude worse" as "the calibration is bad".
+- **The "9-DOF Mahony has a structural ~6.8° tilt error" claim is RETRACTED (2026-08-06).** Re-measured
+  at rest on a clean topic: **Mahony 0.134° mean, EKF 0.117°** over 76 s (max gyro rate 0.26 °/s),
+  roll/pitch agreeing with gravity to 0.04°/0.02°, and the two filters' yaw separating by only 0.40°
+  over that span. There is no measurable structural penalty at rest, so **the proposed fix — projecting
+  the magnetic error onto `halfv` — has no demonstrated problem to solve. Do not apply it on theory alone.**
+  The mechanism it targets is real (`ex/ey/ez` add the magnetic cross product to the gravity cross
+  product, so magnetic direction error *can* rotate tilt); it simply is not costing anything measurable
+  once `halfwy` is right and the calibration is good.
+  **Why the 6.8° was wrong, and the general lesson:** `/filtered/attitude` had *two* publishers — an
+  orphaned `state_estimation_node` (ppid 1) running the now-*deleted* binary alongside the current one —
+  so the topic interleaved two filters' output and the subscriber saw a blend. It survived a restart and
+  was invisible in `ros2 node list` beyond a duplicated name; `pgrep -x` cannot find it either (`comm`
+  truncates at 15 chars). **Before any comparison run:** `ros2 topic info /filtered/attitude --verbose |
+  grep -c "Endpoint type: PUBLISHER"` must return **1**, and enumerate `/proc/*/exe` looking for
+  `(deleted)`. Note the bad number *looked* trustworthy — stable at 6.7–7.0° across six 30 s windows.
+  Stability across windows is not evidence of validity when the contaminant is also stationary.
+  Caveat on the new number too: it is **one attitude** (roll −2.7°, pitch 7.3°), stationary. Magnetic
+  contamination of tilt is attitude-dependent by nature, so this is not yet a general result.
+- **Mahony vs EKF, measured 2026-08-06 (post-fix baseline).** Run in parallel, both 6-DOF, compared by
+  subtraction after decoding Mahony's ±5000 and `yaw_offset_`. Static roll/pitch agree to
+  **0.030° / 0.070°**; under hand motion they diverge by up to **4.93°**, which is the accel reading
+  specific force, not either filter being wrong. Yaw error vs integrated gyro after the `null_dir` fix
+  is **−0.80° / −0.20°** per shake event (was −33°/−37°). The two are directly comparable — byte-identical
+  axis transforms, units, mag calibration order, Euler extraction and 500 ms mag timeout — so any
+  difference is filter behaviour, not setup. **These numbers predate the duplicate-publisher discovery
+  above** and were not taken with the publisher count verified; re-take them opportunistically before
+  relying on any of them.
+- **Gyro z bias is not stable between sessions**: measured **−0.044 °/s** during the gyro axis test and
+  **−2.2 °/s** during the comparison runs hours later — a 50× spread. Any 6-DOF yaw-drift number is
+  therefore only valid for the session that produced it; do not carry one forward as a spec. The EKF
+  estimates bias online and so absorbs this; Mahony's `Ki = 0.005` integral does too, but slowly.
+- **`gyro_noise_sigma` is set ~10× above measurement**: configured `0.05`, measured stationary
+  **0.0028–0.0069 °/s/√Hz**. Deliberate headroom for vibration and arrival-timestamp jitter — stationary
+  noise underestimates in-motion noise — but it has never been checked against an Allan variance, so
+  the margin is a guess rather than a bound.
 - **Positive pitch = nose DOWN** in this code's Euler convention (opposite of aerospace convention).
   Confirmed by measurement 2026-08-04. Confirm sign expectations before touching the pitch PID or the
   AUTO scenario.
-- **Accelerometer axes have a ~2% scale/bias asymmetry**: static `|a|` moves 0.986 → 1.009 g across
-  attitudes. Bounds the attitude error at **≤0.6°**, and both filters normalise the accel so it barely
-  touches attitude — but it does shift the EKF's `a_ref_` gate. Fitting it needs a tumble (3 attitudes
-  cannot determine 6 parameters — the same underdetermination as the magnetometer hard iron), so
-  capture accel alongside mag when the tumble finally happens and solve both from one dataset.
+- **Accelerometer needs no calibration — CLOSED 2026-08-06.** Solved from the same tumble as the
+  magnetometer (552 stationary points of 1164). Bias `(−0.0043, +0.0010, −0.0028) g`, the three axis
+  radii agree to **0.3 %**, and applying the fit moves the gravity direction by only **0.26° mean /
+  0.37° max** while barely touching the scatter (1.11 % → 1.07 %). The earlier "~2 % asymmetry, ≤0.6°"
+  claim was an artifact of fitting 6 parameters to 3 attitudes — underdetermined, so it reported the
+  posture spread as sensor error. Nothing to implement; the ≤0.4 % scale error does not meaningfully
+  shift the EKF's `a_ref_` gate either.
 - **Roll/pitch have no offset calibration** analogous to `yaw_offset_`, so a non-level mounting shows
   up as permanent nonzero attitude.
 - `state_estimation_node.cpp`: `btn1_long_processed_` was missing from the constructor initializer
