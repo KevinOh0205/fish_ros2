@@ -211,12 +211,17 @@ explicitly reject non-0/1 values so the `1 → 255` transition isn't misread as 
 - **Magnetometer data is contaminated** — see §8. Highest-priority open defect; it puts a 5° error
   into Mahony's roll today. Cause not yet isolated between axis remap and hard iron; needs a tumble
   test that solves both together, not a guess.
-- **The IMU axis transform is verified for the accelerometer only** (`state_estimation_node.cpp:575-580`,
-  `R = [0 0 −1; −1 0 0; 0 1 0]`, `det = +1`). Tilt cross-axis test, 2026-08-04, two runs: the physical
-  rotation axis sits **0.01°** from where the non-level baseline predicts, and both signs check out
-  (nose up → pitch negative; port side up → roll positive). What that test **cannot** cover: gravity is
-  blind to yaw, so the **yaw axis and the whole gyro path remain unverified** — that needs a yaw
-  rotation test, not a tilt.
+- **The IMU axis transform is verified end to end** (`state_estimation_node.cpp:575-580`,
+  `R = [0 0 −1; −1 0 0; 0 1 0]`, `det = +1`) — accelerometer and gyro, all three axes, signs included.
+  Accel, tilt cross-axis test 2026-08-04 (two runs): the physical rotation axis sits **0.01°** from
+  where the non-level baseline predicts; nose up → pitch negative, port side up → roll positive.
+  Gyro, 2026-08-06: integrate the gyro as a quaternion and compare its predicted gravity against the
+  (already verified) accel. Residual **at rest** after a 61 s run was 1.79° worst case. A flat 360°
+  spin closed to **+359.96°** — magnitude and sign both right (counterclockwise = `yaw+` = 좌선회) —
+  and left only 0.53° of tilt residual, which is what rules out gyro Z leaking into X/Y.
+  Judge that test on the **at-rest** residual, never on the error during motion: sliding the robot by
+  hand pushed the in-motion error to 7.7°, because the accel reads specific force (gravity minus
+  linear acceleration), not gravity. It falls back under 1° the moment the robot stops.
   Two things to know before reading a tilt result: (a) the mounting baseline is **pitch ≈ 7.9°**, not
   level, and rotating about a world-horizontal axis from a tilted start moves the Euler *other* angle by
   ~2° at 45° — a geometric artifact, not an axis error; (b) a wrong axis transform is a rotation, and
