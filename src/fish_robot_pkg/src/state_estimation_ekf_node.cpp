@@ -540,11 +540,34 @@ private:
     // 준최적 K에서 (I-KH)P 는 대칭성도 PSD도 보장하지 않아 P가 비양정이 될 수 있다.
     // Joseph 형태는 합동변환된 PSD 행렬 두 개의 합이라 **어떤 K에서도** PSD다.
     // 6x6에서 추가 비용 약 650 flop (~0.2us). 사실상 공짜.
+    //
+    // null_dir : 이 방향으로는 **보정하지 않는다** (단위벡터, body 프레임).
+    //   그 관측이 원리적으로 볼 수 없는 방향을 넘기면 된다. 가속도라면 월드 수직
+    //   방향(g_b)이다 — 중력은 어느 방향을 보든 똑같으므로 yaw 정보가 전혀 없다.
+    //
+    //   왜 필요한가 (2026-08-06 실측으로 확인된 버그):
+    //     H_a 의 널공간이 g_b 라 이론상 가속도는 yaw 를 못 건드린다. 그러나 게인은
+    //     K = P Ht S^-1 이고, P 에 yaw <-> 기울기 상관이 조금이라도 쌓이면 그 통로로
+    //     보정이 새어 yaw 가 돌아간다. 초기 P_yaw 가 60도로 크면 그 누설이 증폭된다.
+    //     6축에서 로봇을 yaw 로 흔들었더니 한 번에 -33도, 재현 시 -37도가 샜다.
+    //     같은 구간 Mahony 는 -0.75도 (외적 구조상 yaw 성분이 애초에 0이라 안전하다).
+    //     결정적 증거: 6축인데 yaw 1시그마가 40 -> 17 -> 7도로 **줄었다**. yaw 를
+    //     관측하는 센서가 하나도 없는데 확신이 늘어난 것 자체가 누설의 증거다.
+    //
+    //   보정값(dx)만 잘라내면 반쪽짜리다. 그러면 P 는 여전히 "yaw 정보를 얻었다"고
+    //   갱신되어 확신이 계속 줄고, 증상만 가린 채 원인이 남는다. 그래서 **게인 K 를**
+    //   자른다. 그러면 dx 와 Joseph 공분산 갱신이 같은 K 를 쓰므로 둘이 자동으로
+    //   일관되고, P_yaw 는 예측 단계의 Q 만큼 정직하게 커진다.
+    //   (Joseph 형태는 어떤 K 에서도 PSD 라 잘린 K 를 넣어도 안전하다.)
+    //
+    //   자세 블록과 바이어스 블록을 **둘 다** 자른다. 자이로 바이어스의 g_b 성분은
+    //   월드 수직축 둘레의 회전을 만들므로 그것도 중력으로는 관측 불가다.
     template <int M>
     bool update(const Eigen::Matrix<S, M, 6> &H,
                 const Eigen::Matrix<S, M, 1> &nu,
                 const Eigen::Matrix<S, M, M> &R,
-                S nis_gate)
+                S nis_gate,
+                const Vec3 *null_dir = nullptr)
     {
         Eigen::Matrix<S, M, M> Sm = H * P_ * H.transpose() + R;
         Sm = (0.5 * (Sm + Sm.transpose())).eval();
@@ -562,7 +585,14 @@ private:
 
         // K = P Ht S^-1. S와 P가 대칭이므로 (P Ht S^-1)t = S^-1 H P.
         const Eigen::Matrix<S, M, 6> Sinv_HP = llt.solve(H * P_);
-        const Eigen::Matrix<S, 6, M> K = Sinv_HP.transpose();
+        Eigen::Matrix<S, 6, M> K = Sinv_HP.transpose();
+
+        // 관측 불가 방향 사영 — 위 주석의 누설 차단. 이 아래는 전부 잘린 K를 쓴다.
+        if (null_dir != nullptr) {
+            const Mat3 Pp = Mat3::Identity() - (*null_dir) * null_dir->transpose();
+            K.template topRows<3>()    = (Pp * K.template topRows<3>()).eval();
+            K.template bottomRows<3>() = (Pp * K.template bottomRows<3>()).eval();
+        }
 
         const Vec6 dx = K * nu;
         if (!dx.allFinite()) { numeric_fault_++; return false; }
@@ -615,7 +645,10 @@ private:
         const S infl = 1.0 + rn * rn + (wn * wn) / sa2_;
         const Mat3 R = (sa2_ * infl) * Mat3::Identity();
 
-        return update<3>(H, nu, R, CHI2_3_999);
+        // g_b 방향(월드 수직)으로는 보정하지 않는다. 중력은 yaw 정보를 담지 않으므로
+        // 그 방향 성분은 관측이 준 정보가 아니라 P의 상관을 타고 들어온 찌꺼기다.
+        // 이걸 빼야 6축에서 흔들 때 yaw가 -33도씩 새던 문제가 사라진다.
+        return update<3>(H, nu, R, CHI2_3_999, &g_b);
     }
 
     // =========================================================================
@@ -725,6 +758,9 @@ private:
         Eigen::Matrix<S, 1, 1> R;
         R(0, 0) = sm2_ + slip * slip;
 
+        // 여기는 null_dir 을 넘기지 않는다 — 넘기면 안 된다. 가속도와 정반대로,
+        // 이 관측이 주는 정보는 **월드 수직축 둘레 회전(yaw) 그 자체**다.
+        // g_b 를 사영해 버리면 지자기 갱신이 통째로 0이 된다.
         return update<1>(H, nu, R, CHI2_1_99);
     }
 
@@ -940,7 +976,10 @@ private:
         H.block<3, 3>(0, 3) = Mat3::Identity();
         const Vec3 nu = mean - b_;
         const Mat3 R = (sigma_bcal * sigma_bcal) * Mat3::Identity();
-        update<3>(H, nu, R, 1e9);   // 이 관측은 게이팅하지 않는다 (게이트하면 존재 이유가 없다)
+        // 게이팅하지 않는다 (게이트하면 존재 이유가 없다). 사영도 하지 않는다 —
+        // 정지 창의 자이로 평균은 세 축 바이어스를 모두 직접 잰 값이므로
+        // g_b 방향 성분도 정당한 관측이다.
+        update<3>(H, nu, R, 1e9);
 
         bias_seeded_ = true;
         a_ref_ = anorm_mean;

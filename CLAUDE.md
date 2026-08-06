@@ -233,6 +233,17 @@ explicitly reject non-0/1 values so the `1 → 255` transition isn't misread as 
   Note the Euler readout **is** degenerate near pitch ±90 — during that nose-up hold the reported roll
   wandered 20° while the true attitude moved 0.9°. Judge stillness on the gravity vector, never on
   Euler angles.
+- `state_estimation_ekf_node`: the accelerometer update **must** project the world-vertical direction
+  (`g_b`) out of the Kalman gain — `update()` takes a `null_dir` for this and `update_accel` passes
+  `&g_b`. Without it the accel update leaked into yaw: shaking the robot in yaw cost **−33°/−37°** per
+  event in 6-DOF (Mahony, whose cross-product correction is structurally yaw-free, lost 0.7°/2.7°).
+  `H_a`'s null space is `g_b` in theory, but `K = P Hᵀ S⁻¹` re-introduces yaw through any
+  yaw↔tilt correlation in `P`, amplified by the 60° initial yaw variance. Project the **gain**, not the
+  state correction — projecting `dx` alone leaves `P` still counting yaw information, so the leak's
+  cause survives while its symptom hides. Diagnostic: in 6-DOF the yaw 1σ (`ekf_status[5]`) must only
+  ever **grow** — nothing observes yaw, so shrinking is proof of a leak (measured 40°→7° before the fix,
+  60°→61° after). Do **not** pass `null_dir` to the magnetometer update (yaw is the only thing it
+  observes) or to the bias pseudo-measurement (a stationary average genuinely measures all three axes).
 - **Positive pitch = nose DOWN** in this code's Euler convention (opposite of aerospace convention).
   Confirmed by measurement 2026-08-04. Confirm sign expectations before touching the pitch PID or the
   AUTO scenario.
