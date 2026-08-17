@@ -207,9 +207,12 @@ Two method traps, both hit on 2026-08-06:
 
 #### What is still open
 
-- **Field magnitude is 30 % low**: 34.7 µT after correction against Korea's ~50 µT. Direction is
-  right, so heading and attitude are unaffected — but a real scale error would also mean the AK8963
-  ASA sensitivity ROM may not be applied anywhere in `i2c_driver_node`. Unverified.
+- **Field magnitude is 30 % low, and the cause is now known**: 34.7 µT after correction against Korea's
+  ~50 µT. **The AK8963 ASA sensitivity ROM (0x10–0x12) is never read** — `i2c_driver_node.cpp:203-205`
+  multiplies a flat `0.15 µT/LSB` per axis and nothing in the file references ASA. Direction is right
+  (the 1.01 spin ratio proves it) and per-axis ASA differences are absorbed by the soft-iron scales,
+  so heading and attitude are unaffected; this is a magnitude-only defect. Fixing it would also mean
+  redoing the calibration, since the scales currently carry part of the ASA correction.
 - ~~End-to-end heading~~ — **CLOSED 2026-08-06 by the 360° spin.** See the sub-section below.
 - **Thermal drift, unresolved.** After a 4-core CPU load the field moved 3 µT and its noise tripled
   (σ 0.68 → 2.64) *in the phase after the load* — consistent with heat reaching the sensor rather than
@@ -235,13 +238,81 @@ the mag noise, so per-sample sign flips are noise: raw scoring returns >3500° f
 including the good one.
 
 Residual against the gyro: **median 2.22°, 95 %ile 5.87°, σ 3.10°** — and it is a **single sine cycle
-per revolution, amplitude 3.58°**, which is the signature of leftover hard iron. Back-solving gives
-**1.34 µT horizontal**, matching the ellipsoid fit's own 1.5 µT residual. So the remaining error is the
-known calibration residual showing up exactly as predicted, not a new fault; removing that one cycle
-leaves 2.08°. The lone 18.1° excursion is a momentary spike at −3 °/s (10 of 6601 samples exceed 10°).
+per revolution, amplitude 3.58°**; removing that one cycle leaves 2.08°. The lone 18.1° excursion is a
+momentary spike at −3 °/s (10 of 6601 samples exceed 10°). Reproduced independently on 2026-08-07
+(experiment B, a clean −346° revolution): **3.67°**, with the 2-cycle term only 0.66° and the
+3-cycle 0.18°, so it really is one cycle. See the next sub-section for what causes it — **not**
+leftover hard iron, despite the signature.
 
 `|m|` scatter while turning was **2.5 %**, better than the tumble's 4.3 % — a level spin is the easy
 case, but it confirms the calibration does not fall apart with attitude.
+
+#### The calibration model is at its limit — do not try to fit it better (2026-08-07)
+
+**A previous version of this section said the 3.58° sine was "leftover hard iron, 1.34 µT, matching
+the ellipsoid fit's own 1.5 µT residual". That causal story is WRONG and it sends people to re-fit
+the calibration, which cannot work.** The 1.34 µT was *back-solved from the sine itself*, not measured;
+citing it as confirmation was circular. And the fit's 1.5 µT is **scatter, not centre offset** — the
+two are different quantities and only an offset is removable by calibration.
+
+Re-fitting the same 1164-point tumble with a **general (tilted-axis) ellipsoid** — 9 parameters
+instead of the 6 the current file uses — changes essentially nothing:
+
+| | \|m\| | scatter | dip (143° correct) |
+|---|---|---|---|
+| current file (axis-aligned, 6 par.) | 34.74 ± 1.49 µT | 4.28 % | 144.47 ± 2.86° |
+| general ellipsoid (9 par.) | 34.74 ± 1.43 µT | 4.12 % | 144.34 ± 2.79° |
+
+The two centres differ by **0.25 µT**, which predicts a heading sine of only **0.44°** — an eighth of
+what is measured. Soft-iron off-diagonal terms come out at **1.5 %** of the diagonal. **This robot's
+distortion genuinely is an axis-aligned ellipsoid; there is no more hard or soft iron to remove.**
+
+**The sine is not body-fixed either — it is mostly the ROOM, not the robot.** Leftover hard iron would
+be phase-locked to absolute heading. It is not. Fitting the 1-cycle phase against Mahony's own yaw
+(a valid common absolute reference here: `state_estimation_node` PID 29866 ran unrestarted across both
+runs, so `yaw_offset_` is identical) gives:
+
+| run | direction | amplitude | phase |
+|---|---|---|---|
+| 2026-08-06 20:20 `verify_spin` | CCW −357.7° | 2.79° | **18.1° ± 0.2** |
+| 2026-08-07 12:10 experiment B | CCW −346.3° | 3.60° | **125.6° ± 0.3** |
+
+**107° apart, against fit uncertainties of 0.3°.** Two clean same-direction revolutions, same process,
+same calibration file, 16 h apart. Within the 2026-08-07 run alone, two revolutions ten minutes apart
+sat 76° apart. Whatever this is, it does not travel with the robot.
+
+What does fit: **a hand-held turn swings the sensor around an arc of a few tens of cm, so it traverses
+a spatial field gradient**, and position is a function of heading. That predicts the heading error and
+the `|m|` variation are both 1-cycle and **in quadrature** — the perturbation's component perpendicular
+to the field moves heading, the parallel component moves magnitude. Measured on the 2026-08-06 spin:
+
+```
+heading error  1-cycle  2.787°  phase  18.1°   ->  perpendicular perturbation 0.98 µT
+|m|            1-cycle  0.760 µT phase 90.3°
+                                  phase difference +72°  (predicted ±90)
+                                  magnitude ratio  0.77  (predicted ~1)
+```
+
+**Confirmed 2026-08-07 by reversing the rotation**: two more clean revolutions minutes apart at one
+spot, one each direction, land at **136.0° ± 0.5 (CW)** and **115.4° ± 0.3 (CCW)** — 20.5° apart — and
+the earlier same-spot CCW run sat at 125.6°. So all three same-place runs cluster within ~20°, while the
+run from a different place 16 h earlier is 107° away. **Phase is set by where you stand, not by the
+robot and not by the direction of turn.** A body-fixed error could not do that; a filter lag would flip
+sign when the rotation reverses, and it does not. Amplitude varies 2.0–4.4° between runs, consistent
+with the arm's arc radius changing.
+
+A sharp prediction that came out right twice, so treat the dominant term as **environmental, not a
+sensor or calibration defect**. Consequences: (a) **a hand-held spin in this room cannot validate
+heading better than ~3°** — do not read a 3° residual as a robot fault; (b) part of the tumble's own
+4.3 % scatter is probably the same effect, since that tumble was also hand-held over ~30 cm, meaning
+the calibration may be better than 4.3 % suggests; (c) the residual's ~50 % direction-coherence
+(correlation **+0.48** between tumble samples within 15° of each other, neighbour-difference RMS
+1.64 µT against 2.13 for pure noise) is consistent with a positional term rather than a fittable
+body-fixed one.
+
+**The EKF suppresses it 2.7× (3.67° → 1.36°)** because its yaw update is 1-D and slow (effective
+τ ≈ 9 s, against Mahony's ≈ 1 s, which passes a 0.042 Hz sine at 97 %). That advantage is real, but
+note what it is rejecting: an environmental disturbance, not a sensor error.
 
 **Subtract the gyro bias before using the gyro as truth.** It was **−2.2 °/s** in this session (see the
 gyro-bias gap below), i.e. 66° of phantom rotation per 30 s. `verify_spin.py` measures it from a 6 s
@@ -369,6 +440,39 @@ explicitly reject non-0/1 values so the `1 → 255` transition isn't misread as 
   difference is filter behaviour, not setup. **These numbers predate the duplicate-publisher discovery
   above** and were not taken with the publisher count verified; re-take them opportunistically before
   relying on any of them.
+- **Mahony vs EKF, both 9-DOF, under disturbance — measured 2026-08-07 (experiment B).** 106 s hand-held,
+  publisher count verified at 1 first. Phases were classified *from the data* (rotation = 1 s mean of the
+  **signed** rate, which cancels under shaking; shake = RMS of `|a|` deviation), so "rotate + shake"
+  falls out as its own label. Truth is the gyro integrated as a quaternion, which drifted only **0.6°
+  over 106 s**.
+  **At rest the two are indistinguishable** (0.79/0.41°, 0.22/0.52°, 0.27/0.26° over three stationary
+  spans) — consistent with the 0.134°/0.117° figure, and the reason a static test can never rank them.
+  **Under rotate+shake (22 s pooled) the EKF is 2.8× better**: mean tilt error **1.36° vs 0.49°**,
+  95 %ile 2.37° vs 0.89°, max 3.16° vs 1.35°. The gate genuinely engaged — 63–73 % of those samples
+  exceeded the 0.02 g soft knee and 0.2–0.9 % hit the 0.30 g hard reject. The gap is not truth drift:
+  the **angle between the two filters** (truth-independent) is 1.06–1.09°, matching the 0.85–0.89°
+  difference in their errors, so they really are ~1° apart with the EKF on the correct side.
+  **Heading: both track total sweep at ratio 1.00** over two near-full revolutions (−346°, +356°) — which
+  is exactly why total sweep must not be the criterion. Per-45°, Mahony spreads **41.0–48.1** and the EKF
+  **43.3–45.9**. Filter lag is **≈0 for both** (−6 to −12 ms), so the spread is the magnetic residual
+  above, not dynamics.
+  The error sine's phase did **not** repeat between the two revolutions (76°), nor against the previous
+  session's clean spin (107°) — see §8's "calibration model is at its limit". A repeat spin test is
+  **not** needed to settle that; it is already settled, and the answer is that the sine is environmental.
+- **EKF 6-DOF yaw drift: PASSED 2026-08-07 at +0.155 °/min against the ≤ 2 °/min gate** — the one
+  go/no-go criterion the EKF plan set for itself, and the last thing blocking launch integration.
+  10 min stationary, `use_mag:=false`, first 60 s dropped as the convergence window, 93.8 Hz. Drift is
+  steady across the run (+0.19, +0.15, +0.11, +0.22, +0.20, +0.05 °/min over 90 s windows), total
+  +1.31° in 9 min, roll/pitch moved 0.08°/0.04°. **The online bias estimate matched the raw stationary
+  gyro mean to 0.002 °/s on all three axes** (`[+0.6612 +0.2523 −2.2106]` vs `[+0.6615 +0.2534
+  −2.2083]`) — with `bz` at −2.21 °/s this session, which is the same large bias that made yesterday's
+  numbers useless and which the EKF simply absorbs.
+  **The "yaw 1σ must only grow" diagnostic passes, but do not judge it per-sample.** It grew 59.32° →
+  64.82°; of 5027 actual status updates, 66 decreased, totalling **−0.025° against +5.531° of growth
+  (0.44 %)**, largest single step −0.011° (0.018 % of σ), never more than 2 in a row. That is
+  floating-point noise in the Joseph form and the symmetrize, not a leak — the real leak on 2026-08-06
+  was a *sustained* 40° → 7°. A per-sample threshold false-alarms on this; score the cumulative
+  decrease as a fraction of the increase.
 - **Gyro z bias is not stable between sessions**: measured **−0.044 °/s** during the gyro axis test and
   **−2.2 °/s** during the comparison runs hours later — a 50× spread. Any 6-DOF yaw-drift number is
   therefore only valid for the session that produced it; do not carry one forward as a spec. The EKF
