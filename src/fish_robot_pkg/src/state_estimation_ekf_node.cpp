@@ -1,17 +1,32 @@
 // =============================================================================
 //  state_estimation_ekf_node.cpp
 //
-//  역할 : 자이로를 예측 입력으로, 가속도·지자기를 관측으로 삼아 EKF로 자세를
-//         추정한다. 기존 state_estimation_node(Mahony)와 **병렬로** 돌면서
-//         두 추정기를 정량 비교하기 위한 노드다.
+//  역할 : **제어 경로의 자세 추정기** — 구 state_estimation_node(Mahony)의 완전
+//         대체 (2026-08-17 이관). 자이로를 예측 입력으로, 가속도·지자기를 관측으로
+//         삼아 MEKF로 자세를 추정하고, 구 노드가 쥐고 있던 /filtered/attitude 발행
+//         (±5000 모드 인코딩 + yaw 영점)·버튼 UI·압력 영점·지자기 캘리브레이션
+//         트리거까지 전부 승계한다. 이관 근거는 실측이다: 교란 중 기울기 오차
+//         1/2.8 (1.36도 -> 0.49도), 지자기 복구 시 자세 요동 1/54 수준,
+//         6축 yaw 드리프트 +0.155도/분 (합격 기준 2.0도/분 통과).
 //
-//   [입력] /raw/imu_6dof      (Imu)      가속도 3축[g] + 각속도 3축[도/초], 100Hz
-//          /raw/magnetometer  (Vector3)  지자기 3축[uT], 95Hz  (use_mag=true일 때만 구독)
+//   [입력] /raw/imu_6dof         (Imu)                  가속도 3축[g] + 각속도 3축[도/초], 100Hz
+//          /raw/magnetometer     (Vector3)              지자기 3축[uT], 95Hz  (use_mag=true일 때만 구독)
+//          /rc/status            (Int32MultiArray[5])   버튼 입력 (1틱 = 10ms)
+//          /sensor/pressure_raw  (Float32MultiArray[6]) 압력 3채널[mbar] + 온도 3채널[°C], ~11Hz
+//   [출력] /filtered/attitude          (Vector3) 자세 + 모드 플래그 — 제어 소비 3곳이 구독
+//                                       x = roll (+5000 = AUTO), y = pitch,
+//                                       z = yaw − yaw_offset_ (±180도 랩)
+//          /filtered/attitude_ekf      (Vector3) 순수 EKF 자세 — 오프셋·인코딩 없음
+//                                       (비교 스크립트 호환 + 진단용으로 그대로 유지)
+//          /filtered/ekf_status        (Float32MultiArray[12]) 진단, 10Hz
+//          /sensor/pressure_calibrated (Float32MultiArray[3])  대기압 영점 제거된 수압
+//          /CH_IMU                     (Imu)     축 변환된 IMU  (검증용, 제어에 미사용)
+//          /CH_MEGNET                  (Vector3) 축 변환된 지자기 (검증용, 제어에 미사용)
+//   [서비스] /calibrate_mag (std_srvs/Trigger)  magneto_cal.py 실행/조기 종료 토글
 //
-//  ※ 9축/6축 전환 : 기존 노드와 **같은 500ms 워치독**으로 자동 전환한다. 지자기가
-//     살아있으면 9축, 끊기면 6축, 돌아오면 다시 9축. 두 추정기가 같은 순간에
-//     떨어져야 비교가 성립하므로 기준값(mag_timeout_ms)을 일부러 맞췄다.
-//     다만 판정은 세 단계로 더 촘촘하다 (update_mag_yaw 주석 참조):
+//  ※ 9축/6축 전환 : 구 노드와 **같은 500ms 워치독**으로 자동 전환한다. 지자기가
+//     살아있으면 9축, 끊기면 6축, 돌아오면 다시 9축. 캘리브레이션 중에도 강제
+//     6축이다 (구 노드와 동일). 판정은 세 단계로 더 촘촘하다 (update_mag_yaw 참조):
 //       1) 복각 게이트 — 지자기·중력 사잇각은 장소 상수(한국 약 143도)다.
 //          이게 흔들리면 자기 교란. **크기만 보는 검사가 못 잡는 것을 잡는다**
 //       2) 크기 게이트 — 런타임 실측 |m| 대비 +-20%
@@ -19,31 +34,30 @@
 //     그리고 폴백 자체는 공분산이 알아서 처리한다. 지자기가 없는 동안 yaw는
 //     관측 불가라 P가 자라고, 돌아오는 순간 게인이 그만큼 커져 **쌓인 드리프트에
 //     비례해** 되돌린다. Mahony의 고정 Kp는 1초를 쉬든 10분을 쉬든 똑같이 당긴다.
-//   [출력] /filtered/attitude_ekf (Vector3)              자세 Roll/Pitch/Yaw [도], 100Hz
-//          /filtered/ekf_status    (Float32MultiArray[12]) 진단, 10Hz
-//   [서비스] 없음 — 하나도 광고하지 않는다 (아래 "공존 규칙" 참조)
 //
-//  ※※ 절대 금지 ※※
-//     이 노드는 /filtered/attitude 를 **절대** 발행하지 않는다. 그 토픽은
+//  ※※ 구 state_estimation_node 와 동시 실행 절대 금지 ※※
+//     이 노드가 이제 /filtered/attitude 의 **유일한** 발행자다. 그 토픽은
 //     pid_control_node / auto_scenario_node / data_logger_node 가 구독하며,
-//     pid_control_node는 타이머 없이 그 콜백 안에서 PID를 돌린다. 발행자가 둘이
-//     되면 제어 주기가 200Hz가 되는데, PID 게인은 dt를 생략하고 100Hz를 가정하므로
-//     제어 법칙이 곧바로 깨진다. 게다가 서로 다른 추정치가 번갈아 들어간다.
-//     토픽 이름을 바꿔야 할 일이 생기면 그 전에 이 주석을 다시 읽을 것.
+//     pid_control_node는 타이머 없이 그 콜백 안에서 PID를 돌린다. 구 노드를 함께
+//     띄우면 발행자가 둘 = 제어 주기 200Hz가 되는데, PID 게인은 dt를 생략하고
+//     100Hz를 가정하므로 제어 법칙이 곧바로 깨진다. 게다가 서로 다른 추정치가
+//     번갈아 들어가고, /calibrate_mag 서비스도 중복 광고가 된다 (어느 서버가
+//     응답할지 ROS2 명세상 정의되지 않는다). 구 노드는 저장소에 롤백 경로로만
+//     남기고 launch 에서 뺐다 — 수동으로도 같이 띄우지 말 것.
+//     기동 전 확인: ros2 topic info /filtered/attitude --verbose | grep -c PUBLISHER -> 1
 //
-//  ── 공존 규칙 (기존 노드와 write-set을 완전히 분리한다) ──────────────────────
-//    · 발행은 위 두 토픽뿐. /CH_IMU, /CH_MEGNET, /sensor/pressure_calibrated 미발행
-//    · 서비스 미광고. /calibrate_mag 를 중복 광고하면 어느 서버가 응답할지
-//      ROS2 명세상 정의되지 않는데, 그 핸들러는 보정 파일을 truncate-write 한다.
-//      (CMakeLists에서 std_srvs 의존성을 일부러 빼두어 컴파일 단계에서 막는다)
-//    · mag_calib_params.txt 는 **읽기만** 한다. 절대 쓰지 않는다 — 락이 없어
-//      동시 쓰기가 파일을 찢고, 그러면 다음 부팅의 >> 파싱이 6개 중 일부만 읽어
-//      나머지를 기본값으로 남긴다. 며칠 뒤 "이유 없이 yaw가 나빠졌다"로 나타난다.
-//    · /rc/status 를 구독하지 않는다. 버튼 FSM을 복제하면 is_auto_mode_ 가 두 개가
-//      되고, 무엇보다 btn2 짧게 = yaw_offset_ 설정이라 버튼 한 번에 두 yaw 그래프가
-//      상수만큼 어긋난다. 그래서 이 노드의 yaw는 **오프셋 없는 절대값**이다.
-//    · ±5000 모드 인코딩을 싣지 않는다. 제어 소비자가 없고, 실으면 AUTO 모드일 때
-//      두 토픽의 단순 뺄셈 비교가 깨진다.
+//  ── 모드 전달 규약 (구 노드에서 승계, CLAUDE.md §1) ─────────────────────────
+//    자동 모드일 때 attitude.x(roll)에 +5000을 더해 발행한다. 별도 모드 토픽 없이
+//    자세 토픽으로 모드를 실어 나르며, 소비 3곳이 |x| > 2500 으로 해독한다.
+//    인코딩을 바꾸면 해독 3곳 + 이 인코딩 1곳, 네 파일을 함께 바꿔야 한다.
+//
+//  ── 지자기 캘리브레이션 : min/max 폐기, magneto_cal.py 이관 ─────────────────
+//    btn2 길게 / /calibrate_mag → scripts/magneto_cal.py(텀블 + 타원체 피팅)를
+//    서브프로세스로 실행한다. 구 노드의 min/max는 실측에서 무보정보다 나빴다
+//    (흩어짐 38.1% vs 22.1%, 2026-08-06). 진행 중 재트리거 = SIGINT 조기 종료.
+//    exit 0(품질 게이트 통과·저장)이면 계수를 즉시 재로드한다 — 재시작 불필요.
+//    이 노드는 mag_calib_params.txt 를 **읽기만** 한다. 쓰기는 magneto_cal.py
+//    단독이며, 스크립트가 자체 백업(.bak_날짜)과 품질 게이트(흩어짐 8%)를 갖는다.
 //
 //  ── 핵심 알고리즘 : MEKF (Multiplicative EKF) ───────────────────────────────
 //    공칭 상태 : 쿼터니언 q (body->world) + 자이로 바이어스 b [rad/s]
@@ -75,6 +89,8 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/int32_multi_array.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
@@ -84,6 +100,12 @@
 #include <fstream>
 #include <string>
 #include <vector>
+
+#include <csignal>      // kill(SIGINT) — magneto_cal.py 조기 종료
+#include <sys/wait.h>   // waitpid(WNOHANG) — 서브프로세스 회수
+#include <unistd.h>     // waitpid 보조
+#include <spawn.h>      // posix_spawnp — MT 프로세스에서 안전한 스폰
+extern char **environ;  // posix_spawnp 에 물려줄 환경
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -106,6 +128,12 @@ static constexpr S R2D = 180.0 / M_PI;
 
 #define GYRO_CALIB_SAMPLES 1000   // 100Hz 기준 10초. 기존 노드와 동일한 창 크기
 #define STILLNESS_MAX_RETRY 3     // 정지 판정 실패 시 재시도 횟수
+
+// 압력 영점 (구 state_estimation_node 에서 수치 그대로 이식)
+#define PRESSURE_CALIB_SAMPLES 100   // 압력 11Hz 기준 약 9초
+// [N2] 압력 영점 캡처 전 웜업 대기(초). 웜업 시간 드리프트의 초반 급강하(ch0 ~250초)를
+// 지나 baseline 을 잡기 위함. 드리프트의 원인은 온도가 아니라 경과 시간(R²≈0.95).
+#define PRESSURE_WARMUP_SEC 300
 
 // dt 구간 구분 (100Hz 공칭 = 10ms)
 static constexpr S DT_LONG_SEC  = 0.05;   // 5샘플 유실. 여기부터는 로그를 남긴다
@@ -182,6 +210,16 @@ public:
           latest_m_(Vec3::Zero()),
           mag_fresh_(false),
           mag_far_count_(0),
+          is_auto_mode_(false),
+          btn1_press_count_(0),
+          btn1_counter_(0), btn2_counter_(0),
+          prev_btn1_(0), prev_btn2_(0),
+          btn1_long_processed_(false), btn2_long_processed_(false),
+          raw_yaw_(0.0f), yaw_offset_(0.0f),
+          press_calibrated_(false), press_sample_count_(0),
+          node_start_time_(0, 0, RCL_ROS_TIME),
+          is_mag_calibrating_(false),
+          calib_pid_(-1),
           have_prev_stamp_(false),
           t_prev_(0, 0, RCL_ROS_TIME),
           last_mag_time_(0, 0, RCL_ROS_TIME),
@@ -197,11 +235,11 @@ public:
     {
         declare_params();
 
-        // 지자기 보정 계수는 기존 노드와 **똑같이** 읽는다. 한쪽만 보정하면
-        // yaw 차이가 필터 탓인지 보정 탓인지 구분할 수 없어 비교가 무의미해진다.
+        // 지자기 보정 계수 로드. 캘리브레이션 성공 시(poll_mag_calibration)에도
+        // 같은 함수로 재로드한다 — 이 파일을 읽는 경로는 이 한 곳뿐이다.
         load_mag_calibration_file();
 
-        attitude_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/filtered/attitude_ekf", 10);
+        attitude_ekf_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/filtered/attitude_ekf", 10);
         status_pub_   = this->create_publisher<std_msgs::msg::Float32MultiArray>("/filtered/ekf_status", 10);
 
         imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
@@ -214,6 +252,43 @@ public:
                 "/raw/magnetometer", 10,
                 std::bind(&StateEstimationEkfNode::mag_callback, this, std::placeholders::_1));
         }
+
+        // ── 제어 경로 이관분 (구 state_estimation_node 에서 승계) ──────────────
+        attitude_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/filtered/attitude", 10);
+        pressure_cal_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/sensor/pressure_calibrated", 10);
+
+        // 축 변환 검증용 발행 토픽. 필터에 실제로 들어가는 값을 그대로 내보내므로
+        // /raw/* 와 나란히 echo 하면 회전이 의도대로 걸렸는지 눈으로 대조할 수 있다.
+        //   /CH_IMU    <- /raw/imu_6dof     를 FLU로 회전한 값 (단위 그대로: g, 도/초)
+        //   /CH_MEGNET <- /raw/magnetometer 를 보정 후 FLU로 재배치한 값
+        ch_imu_pub_ = this->create_publisher<sensor_msgs::msg::Imu>("/CH_IMU", 10);
+        ch_magnet_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/CH_MEGNET", 10);
+
+        rc_status_sub_ = this->create_subscription<std_msgs::msg::Int32MultiArray>(
+            "/rc/status", 10,
+            std::bind(&StateEstimationEkfNode::rc_status_callback, this, std::placeholders::_1));
+        pressure_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+            "/sensor/pressure_raw", 10,
+            std::bind(&StateEstimationEkfNode::pressure_callback, this, std::placeholders::_1));
+
+        // 버튼 없이 터미널에서도 지자기 캘리브레이션을 걸 수 있게 서비스로도 노출
+        //   ros2 service call /calibrate_mag std_srvs/srv/Trigger   (재호출 = 조기 종료)
+        mag_calib_srv_ = this->create_service<std_srvs::srv::Trigger>(
+            "/calibrate_mag",
+            std::bind(&StateEstimationEkfNode::handle_mag_calibration, this,
+                      std::placeholders::_1, std::placeholders::_2));
+
+        // 압력 상태 초기화. 웜업 대기는 노드 기동 시각 기준이라, btn1 길게로
+        // 재영점해도 이 시각은 갱신하지 않는다 (이미 데워진 센서는 즉시 재수집).
+        for (int i = 0; i < 3; i++) {
+            press_sum_[i] = 0.0f;  press_offset_[i] = 0.0f;
+            temp_sum_[i]  = 0.0f;  temp_offset_[i]  = 0.0f;
+            press_valid_count_[i] = 0;  press_ch_alive_[i] = false;
+            // [N2 결론] 드리프트의 원인은 온도가 아니라 웜업 경과 시간(R²≈0.95).
+            // 온도 비례 보정은 무효 + 노이즈 증폭이라 계수 0 고정 훅으로만 남긴다.
+            drift_coeff_[i] = 0.0f;
+        }
+        node_start_time_ = this->now();
 
         // 워치독 기준 시각은 반드시 "지금"으로 잡는다. 기본 생성된 Time(=epoch 0)과
         // 차분하면 첫 메시지 전까지 타임아웃 판정이 엉망이 된다.
@@ -289,12 +364,14 @@ private:
                     mag_dip_gate_ * R2D, mag_timeout_ms_);
         RCLCPP_INFO(this->get_logger(), "[EKF]   지자기 보정: bias(%.3f %.3f %.3f) scale(%.4f %.4f %.4f)",
                     mag_bias_x_, mag_bias_y_, mag_bias_z_, mag_scale_x_, mag_scale_y_, mag_scale_z_);
-        RCLCPP_INFO(this->get_logger(), "[EKF] 출력: /filtered/attitude_ekf, /filtered/ekf_status");
-        RCLCPP_INFO(this->get_logger(), "[EKF] (제어에 미사용 — /filtered/attitude 는 발행하지 않음)");
+        RCLCPP_INFO(this->get_logger(), "[EKF] 출력: /filtered/attitude(제어, ±5000 모드 + yaw 영점), /filtered/attitude_ekf(순수값), /filtered/ekf_status");
+        RCLCPP_INFO(this->get_logger(), "[EKF] 부가: /sensor/pressure_calibrated, /CH_IMU, /CH_MEGNET, 서비스 /calibrate_mag (magneto_cal.py)");
+        RCLCPP_INFO(this->get_logger(), "[EKF] ※ 구 state_estimation_node 와 동시 실행 금지 — /filtered/attitude 발행자 2개 = PID 200Hz");
         RCLCPP_INFO(this->get_logger(), "=========================================");
     }
 
-    // 기존 노드와 동일한 경로/순서/폴백. 쓰기 경로는 존재하지 않는다.
+    // 구 노드와 동일한 경로/순서/폴백. 이 노드에 쓰기 경로는 존재하지 않는다 —
+    // mag_calib_params.txt 를 쓰는 것은 magneto_cal.py 단독이다 (백업·품질 게이트 내장).
     void load_mag_calibration_file() {
         // 폴백값도 state_estimation_node.cpp 의 초기화 리스트와 같은 값을 쓴다
         mag_bias_x_ = 8.025f;  mag_bias_y_ = 21.75f; mag_bias_z_ = 17.625f;
@@ -311,6 +388,268 @@ private:
         } else {
             RCLCPP_WARN(this->get_logger(), "[EKF] 지자기 보정 파일 없음 -> 기본값 사용 (%s)", file_path.c_str());
         }
+    }
+
+    // =========================================================================
+    //  버튼 UI (/rc/status 100Hz, 1틱 = 10ms) — 구 state_estimation_node 이식
+    // =========================================================================
+    // 짧게 = 30ms~1초 (>3 && <100 틱), 길게 = 정확히 300틱에서 1회 발화 (== 300).
+    //   btn1 짧게 : 자동/수동 모드 토글 (+5000 인코딩의 근원)
+    //   btn1 길게 : 대기압 영점 재수집
+    //   btn2 짧게 : 현재 방향을 Yaw 0도로 (yaw_offset_ — /filtered/attitude 에만 적용)
+    //   btn2 길게 : magneto_cal.py 실행 / 진행 중이면 SIGINT 조기 종료
+    void rc_status_callback(const std_msgs::msg::Int32MultiArray::SharedPtr msg) {
+        if (msg->data.size() < 2) return;
+        const int32_t btn1 = msg->data[0];
+        const int32_t btn2 = msg->data[1];
+
+        // 통신두절 시 nRF는 버튼을 255로 보낸다. 이때 1→255 전이를 '뗌(release)'으로
+        // 오인해 모드 토글·헤딩 영점이 스퍼리어스하게 트리거되는 것을 막는다(N4).
+        // 양쪽 카운터와 직전 상태를 중립으로 리셋하고 엣지 판정을 건너뛴다.
+        if ((btn1 != 0 && btn1 != 1) || (btn2 != 0 && btn2 != 1)) {
+            btn1_counter_ = 0; btn1_long_processed_ = false; prev_btn1_ = 0;
+            btn2_counter_ = 0; btn2_long_processed_ = false; prev_btn2_ = 0;
+            return;
+        }
+
+        // 버튼 1
+        if (btn1 == 1) {
+            btn1_counter_++;
+            if (btn1_counter_ == 300) {   // 정확히 300틱(3초)에서 한 번만 발동 (>=가 아니라 ==)
+                btn1_long_processed_ = true;   // 뗄 때 짧은 누름으로 중복 처리되지 않게 표시
+                RCLCPP_WARN(this->get_logger(), "======================================================");
+                RCLCPP_WARN(this->get_logger(), "[EKF] 버튼 1 롱프레스 감지! 대기압 영점을 재조정합니다.");
+                RCLCPP_WARN(this->get_logger(), "======================================================");
+                // 압력 캘리브레이션 상태를 통째로 리셋 -> pressure_callback이 다시 수집 모드로
+                // (웜업 대기는 node_start_time_ 기준이라 이미 지났으면 바로 재수집한다)
+                press_calibrated_ = false; press_sample_count_ = 0;
+                for (int i = 0; i < 3; i++) { press_sum_[i] = 0.0f; temp_sum_[i] = 0.0f; press_valid_count_[i] = 0; }
+            }
+        } else {
+            if (prev_btn1_ == 1) {   // Falling Edge = 손을 뗀 순간
+                // 30ms 이상 1초 미만이고 롱프레스로 처리되지 않았을 때만 짧은 누름
+                if (btn1_counter_ > 3 && btn1_counter_ < 100 && !btn1_long_processed_) {
+                    is_auto_mode_ = !is_auto_mode_;
+                    btn1_press_count_++;
+                    RCLCPP_INFO(this->get_logger(), "======================================================");
+                    RCLCPP_INFO(this->get_logger(), "[EKF] 로봇이 %s 모드로 전환되었습니다! (카운트: %d)",
+                                is_auto_mode_ ? "자동(AUTO)" : "수동(MANUAL)", btn1_press_count_);
+                    RCLCPP_INFO(this->get_logger(), "======================================================");
+                }
+            }
+            btn1_counter_ = 0; btn1_long_processed_ = false;
+        }
+        prev_btn1_ = btn1;
+
+        // 버튼 2
+        if (btn2 == 1) {
+            btn2_counter_++;
+            if (btn2_counter_ == 300) {
+                btn2_long_processed_ = true;
+                // 시작/조기 종료/거절을 함수가 알아서 판단하고 로그를 남긴다
+                start_or_stop_mag_calibration(nullptr);
+            }
+        } else {
+            if (prev_btn2_ == 1) {
+                if (btn2_counter_ > 3 && btn2_counter_ < 100 && !btn2_long_processed_) {
+                    // 헤딩 영점: 현재 바라보는 방향을 Yaw 0도로 삼는다.
+                    // 자북이 아니라 "출발 방향" 기준으로 조종하고 싶을 때 사용.
+                    // /filtered/attitude_ekf 는 순수값이라 이 오프셋이 붙지 않는다.
+                    yaw_offset_ = raw_yaw_;
+                    RCLCPP_WARN(this->get_logger(), "======================================================");
+                    RCLCPP_WARN(this->get_logger(), "[EKF] 헤딩(Yaw) 영점 정렬! 현재 방향을 0도로 설정합니다. (Offset: %.2f)", yaw_offset_);
+                    RCLCPP_WARN(this->get_logger(), "======================================================");
+                }
+            }
+            btn2_counter_ = 0; btn2_long_processed_ = false;
+        }
+        prev_btn2_ = btn2;
+    }
+
+    // =========================================================================
+    //  지자기 캘리브레이션 — magneto_cal.py 서브프로세스 (min/max 방식 폐기)
+    // =========================================================================
+    // 구 노드의 min/max 수집은 실측에서 무보정보다 나빴다 (흩어짐 38.1% vs 22.1%,
+    // 2026-08-06). 여기서는 타원체 피팅 도구를 그대로 서브프로세스로 실행한다.
+    //   · 시작: fork + execlp("python3", ..., scripts/magneto_cal.py)
+    //           stdout/stderr 는 부모 것을 물려받아 저널로 흘러간다 (진행 UI 포함)
+    //   · 재트리거: SIGINT — 스크립트는 그때까지의 데이터로 분석·판정을 진행한다
+    //   · 종료 감지: imu_callback 의 status 감쇠 주기에서 waitpid(WNOHANG) 폴링
+    //     exit 0 = 품질 게이트 통과·저장 → 계수 즉시 재로드 + 게이트 기준 재수집
+    //     exit ≠ 0 = 저장 거부/실패 → 기존 계수 유지
+    // 반환값은 서비스 응답용 성공 여부. why 는 nullptr 허용 (버튼 경로).
+    bool start_or_stop_mag_calibration(std::string *why) {
+        if (is_mag_calibrating_) {
+            // 진행 중 재트리거 = 수집 조기 종료 (구 서비스의 "2회 호출 = 종료" 시맨틱 대응)
+            if (calib_pid_ > 0) kill(calib_pid_, SIGINT);
+            RCLCPP_WARN(this->get_logger(),
+                        "[EKF] 지자기 캘리브레이션 조기 종료 요청 (SIGINT) — 수집분으로 분석을 진행합니다");
+            if (why) *why = "조기 종료 요청 — 수집분으로 분석 진행";
+            return true;
+        }
+        // 지자기 센서가 죽어 있으면 시작하지 않는다 (구 노드와 동일한 판정 기준)
+        if ((this->now() - last_mag_time_).seconds() >= mag_timeout_ms_ * 1e-3) {
+            RCLCPP_ERROR(this->get_logger(), "======================================================");
+            RCLCPP_ERROR(this->get_logger(), "[EKF] 지자기 센서(AK8963) 응답이 없습니다! 캘리브레이션을 취소합니다.");
+            RCLCPP_ERROR(this->get_logger(), "======================================================");
+            if (why) *why = "지자기 무응답 — 캘리브레이션 거절";
+            return false;
+        }
+
+        // 경로 조립과 로깅은 fork 전에 끝낸다. 멀티스레드 프로세스(DDS 스레드)의
+        // fork+exec 대신 posix_spawnp를 쓴다. DDS 스레드가 여럿 도는 프로세스에서
+        // fork 자식이 exec 전에 malloc 계열을 건드리면 (execlp의 PATH 탐색 포함)
+        // 다른 스레드가 쥔 락과 데드락할 수 있다 — posix_spawnp는 표준이 이 상황을
+        // 보장하는 유일한 스폰 방식이라 그 계급의 문제가 아예 없다.
+        const char *home = getenv("HOME");
+        const std::string script = std::string(home ? home : "") +
+                                   "/ros2_ws/src/fish_robot_pkg/scripts/magneto_cal.py";
+
+        pid_t pid = -1;
+        char arg0[] = "python3";
+        std::vector<char> arg1(script.begin(), script.end());
+        arg1.push_back('\0');
+        char argu[] = "-u";   // 무버퍼 출력 — 저널로 진행 UI가 실시간으로 흘러가게 한다
+        char *argv_[] = { arg0, argu, arg1.data(), nullptr };
+        const int rc = posix_spawnp(&pid, "python3", nullptr, nullptr, argv_, environ);
+        if (rc != 0) {
+            RCLCPP_ERROR(this->get_logger(),
+                         "[EKF] posix_spawnp 실패 (%d) — 캘리브레이션을 시작하지 못했습니다", rc);
+            if (why) *why = "spawn 실패";
+            return false;
+        }
+        // ── 부모 ──
+        calib_pid_ = pid;
+        is_mag_calibrating_ = true;   // 이 동안 지자기 관측은 강제 6축으로 빠진다
+        RCLCPP_WARN(this->get_logger(), "======================================================");
+        RCLCPP_WARN(this->get_logger(),
+                    "[EKF] 지자기 캘리브레이션 시작 (magneto_cal.py, pid %d)", static_cast<int>(pid));
+        RCLCPP_WARN(this->get_logger(),
+                    "[EKF]   6가지 자세로 로봇을 한 바퀴씩 돌려주세요. 진행 UI는 저널로 흘러갑니다");
+        RCLCPP_WARN(this->get_logger(), "======================================================");
+        if (why) *why = "magneto_cal.py 시작 (pid " + std::to_string(pid) + ")";
+        return true;
+    }
+
+    // 버튼 없이 터미널에서도 걸 수 있는 서비스 진입점 (버튼과 같은 함수를 쓴다)
+    void handle_mag_calibration(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+                                std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        (void)req;   // Trigger 는 요청 필드가 없다 — 미사용 경고 방어
+        std::string why;
+        res->success = start_or_stop_mag_calibration(&why);
+        res->message = why;
+    }
+
+    // magneto_cal.py 종료 회수. imu_callback 의 status 감쇠 주기(~10Hz)로 폴링된다.
+    void poll_mag_calibration() {
+        int st = 0;
+        const pid_t r = waitpid(calib_pid_, &st, WNOHANG);
+        if (r == 0) return;   // 아직 실행 중
+
+        if (r == calib_pid_ && WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+            // 품질 게이트 통과·저장 성공 → 새 계수를 즉시 적용한다 (재시작 불필요).
+            // 게이트 기준(|m| 중앙값·복각)은 옛 보정으로 잰 값이라 새 계수와 안 맞는다.
+            // 무효화해서 재수집시킨다 — 안 하면 새 보정의 샘플들이 옛 기준에 걸려 거부된다.
+            load_mag_calibration_file();
+            mag_ref_valid_ = false;
+            dip_ref_valid_ = false;
+            win_mag_norms_.clear();
+            RCLCPP_INFO(this->get_logger(), "=========================================");
+            RCLCPP_INFO(this->get_logger(), "[EKF] 지자기 캘리브레이션 성공 — 새 보정 즉시 적용");
+            RCLCPP_INFO(this->get_logger(), "[EKF]   bias(%.3f %.3f %.3f) scale(%.4f %.4f %.4f)",
+                        mag_bias_x_, mag_bias_y_, mag_bias_z_, mag_scale_x_, mag_scale_y_, mag_scale_z_);
+            RCLCPP_INFO(this->get_logger(), "=========================================");
+        } else if (r == calib_pid_ && WIFEXITED(st)) {
+            RCLCPP_WARN(this->get_logger(),
+                        "[EKF] 지자기 캘리브레이션 저장 거부/실패 (exit %d) — 기존 계수를 유지합니다"
+                        " (127 = python3/스크립트 실행 실패)", WEXITSTATUS(st));
+        } else {
+            // 시그널 종료(r == pid, !WIFEXITED) 또는 waitpid 오류(r < 0, 예: ECHILD)
+            RCLCPP_WARN(this->get_logger(),
+                        "[EKF] magneto_cal.py 비정상 종료 — 기존 계수를 유지합니다");
+        }
+        is_mag_calibrating_ = false;
+        calib_pid_ = -1;
+    }
+
+    // =========================================================================
+    //  압력 서브시스템 — 구 state_estimation_node 이식 (수치·판정 동일)
+    // =========================================================================
+    // 부팅 후 대기압을 기준(영점)으로 잡고, 이후로는 그 차이만 발행한다.
+    // => 발행값은 사실상 "수심에 의한 게이지 압력"이 된다.
+    void pressure_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+        if (msg->data.size() < 6) return;
+
+        float raw_p[3] = { msg->data[0], msg->data[1], msg->data[2] };
+        float raw_t[3] = { msg->data[3], msg->data[4], msg->data[5] };
+
+        // ================= [영점 캘리브레이션 단계] =================
+        if (!press_calibrated_) {
+            // [N2] 웜업 대기: 전원 직후 압력이 시간에 따라 크게 드리프트하므로,
+            // 초반 급강하 구간을 지난 뒤에 대기압 영점을 캡처한다.
+            double warmup_elapsed = (this->now() - node_start_time_).seconds();
+            if (warmup_elapsed < PRESSURE_WARMUP_SEC) {
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 30000,
+                    "... 압력 센서 웜업 대기 중 (%.0f / %d초). 이후 영점을 자동 캡처합니다 ...",
+                    warmup_elapsed, PRESSURE_WARMUP_SEC);
+                return;
+            }
+
+            // 채널별로 유효한(>=100mbar) 샘플만 누적한다. 죽었거나 mux 실패로 0이 온
+            // 채널은 건너뛰어, ch0에 의존하지 않고 살아있는 센서만으로 보정을 완료한다.
+            bool any_valid = false;
+            for (int i = 0; i < 3; i++) {
+                if (raw_p[i] >= 100.0f) {
+                    press_sum_[i] += raw_p[i];
+                    temp_sum_[i] += raw_t[i];
+                    press_valid_count_[i]++;
+                    any_valid = true;
+                }
+            }
+            if (!any_valid) return;   // 세 채널 모두 무효면 대기
+
+            press_sample_count_++;
+
+            if (press_sample_count_ % 20 == 0) {
+                RCLCPP_INFO(this->get_logger(), "... 압력 센서 대기압 0점 수집 중 (%d / %d) ...", press_sample_count_, PRESSURE_CALIB_SAMPLES);
+            }
+
+            if (press_sample_count_ >= PRESSURE_CALIB_SAMPLES) {
+                for (int i = 0; i < 3; i++) {
+                    // 절반 이상 유효 샘플이 모인 채널만 살아있는 것으로 인정한다.
+                    if (press_valid_count_[i] >= PRESSURE_CALIB_SAMPLES / 2) {
+                        press_offset_[i] = press_sum_[i] / press_valid_count_[i];   // 대기압 평균 = 영점
+                        temp_offset_[i] = temp_sum_[i] / press_valid_count_[i];     // 영점 캡처 당시 온도
+                        press_ch_alive_[i] = true;
+                    } else {
+                        press_ch_alive_[i] = false;
+                    }
+                }
+                press_calibrated_ = true;
+                RCLCPP_INFO(this->get_logger(), "=========================================");
+                RCLCPP_INFO(this->get_logger(), "[OK] 압력 센서 기준 영점 세팅 완료 (물에 넣으셔도 됩니다)");
+                RCLCPP_INFO(this->get_logger(), "     살아있는 채널: [ch0:%s ch1:%s ch2:%s]",
+                            press_ch_alive_[0] ? "O" : "X", press_ch_alive_[1] ? "O" : "X", press_ch_alive_[2] ? "O" : "X");
+                RCLCPP_INFO(this->get_logger(), "=========================================");
+            }
+            return;
+        }
+
+        // ================= [정상 동작 단계] =================
+        auto cal_msg = std_msgs::msg::Float32MultiArray();
+        cal_msg.data.resize(3);
+        for (int i = 0; i < 3; i++) {
+            if (press_ch_alive_[i]) {
+                // drift_coeff_는 위 N2 결론에 따라 0으로 고정되어 있어 실질적으로 무효항이다.
+                // (온도 보정이 다시 필요해질 때를 위해 구조만 남겨둔 상태)
+                float temp_diff = raw_t[i] - temp_offset_[i];
+                float drift_correction = temp_diff * drift_coeff_[i];
+                cal_msg.data[i] = raw_p[i] - press_offset_[i] - drift_correction;
+            } else {
+                cal_msg.data[i] = 0.0f;   // 죽은 채널은 0으로 표시
+            }
+        }
+        pressure_cal_pub_->publish(cal_msg);
     }
 
     // =========================================================================
@@ -331,6 +670,15 @@ private:
         const S cal_mz = (raw_mz - mag_bias_z_) * mag_scale_z_;
         latest_m_ = Vec3(cal_my, cal_mx, -cal_mz);   // R = [0 1 0; 1 0 0; 0 0 -1], det=+1
 
+        // 검증용 발행 (구 노드의 /CH_MEGNET 승계): 융합에 실제로 들어가는 값 그대로.
+        // (하드/소프트아이언 보정까지 적용된 뒤의 값이므로 /raw/magnetometer 와는
+        //  축 순서뿐 아니라 크기도 다르다. 축 방향 확인이 목적이면 부호를 본다)
+        auto ch_mag_msg = geometry_msgs::msg::Vector3();
+        ch_mag_msg.x = latest_m_.x();
+        ch_mag_msg.y = latest_m_.y();
+        ch_mag_msg.z = latest_m_.z();
+        ch_magnet_pub_->publish(ch_mag_msg);
+
         // 지자기 95Hz, IMU 100Hz. 매 IMU 틱마다 융합하면 약 5%가 이중 계산되어
         // 상관된 노이즈를 두 번 세고 헤딩에 과신이 생긴다. 신선한 샘플만 쓴다.
         mag_fresh_ = true;
@@ -344,6 +692,18 @@ private:
             if (std::isfinite(n) && n > 1e-6) win_mag_norms_.push_back(n);
             init_mag_sum_ += latest_m_;
             init_mag_count_++;
+            // 재보정 성공 직후의 기준 재수집 경로: 정지 창(finalize_stationary_window)은
+            // 부팅 때 한 번만 돌므로, bias_seeded_ 이후에 무효화된 |m| 기준은 여기서
+            // ~5초치(500샘플) 중앙값으로 다시 세운다. 이 분기가 없으면 크기 게이트가
+            // 영영 꺼진 채 win_mag_norms_ 만 무한히 자란다.
+            if (bias_seeded_ && win_mag_norms_.size() >= 500) {
+                const size_t mid = win_mag_norms_.size() / 2;
+                std::nth_element(win_mag_norms_.begin(), win_mag_norms_.begin() + mid, win_mag_norms_.end());
+                mag_ref_ = win_mag_norms_[mid];
+                mag_ref_valid_ = true;
+                win_mag_norms_.clear();
+                RCLCPP_INFO(this->get_logger(), "[EKF] |m| 게이트 기준 재확보: %.2f uT (새 보정 기준)", mag_ref_);
+            }
         }
     }
 
@@ -365,13 +725,27 @@ private:
             return;
         }
 
+        // 검증용 발행 (구 노드의 /CH_IMU 승계): 회전만 걸린 상태(단위 변환 전)라
+        // /raw/imu_6dof 와 성분끼리 1:1로 대조된다. 아래 초기화 게이트보다 앞에
+        // 두어 기동 직후 초기화 창(init_samples)에서도 발행된다.
+        auto ch_imu_msg = sensor_msgs::msg::Imu();
+        ch_imu_msg.header.stamp = msg->header.stamp;   // 원본 타임스탬프 유지
+        ch_imu_msg.header.frame_id = "base_link";      // 회전 후에는 로봇 FLU 좌표계
+        ch_imu_msg.linear_acceleration.x = a_flu.x();  // [g]
+        ch_imu_msg.linear_acceleration.y = a_flu.y();
+        ch_imu_msg.linear_acceleration.z = a_flu.z();
+        ch_imu_msg.angular_velocity.x = g_flu.x();     // [도/초]
+        ch_imu_msg.angular_velocity.y = g_flu.y();
+        ch_imu_msg.angular_velocity.z = g_flu.z();
+        ch_imu_pub_->publish(ch_imu_msg);
+
         // 도/초 -> rad/s. 이 한 곳에서만 변환한다. 가속도는 g 단위 그대로 두는데,
         // 정규화해서 방향만 쓰므로 스케일이 결과에 영향을 주지 않기 때문이다.
         const Vec3 gyro_rad = g_flu * D2R;
         const Vec3 accel_g  = a_flu;
 
-        // 축 변환이 기존 노드와 같은지 눈으로 대조할 수 있게 첫 샘플만 찍는다.
-        // (/CH_IMU 를 재발행하는 대신 이 한 줄로 끝낸다 — 같은 값을 두 번 흘릴 이유가 없다)
+        // 축 변환을 눈으로 대조할 수 있게 첫 샘플만 찍는다. /CH_IMU 는 이제 이 노드가
+        // 직접 발행하므로 echo 값과 이 로그가 일치해야 정상이다.
         if (!logged_first_sample_) {
             logged_first_sample_ = true;
             RCLCPP_INFO(this->get_logger(),
@@ -457,14 +831,18 @@ private:
             else                              { flags_ |= 0x08; accel_rej_run_++; }
         }
         if (use_mag_) {
-            // 지자기 생존 판정은 기존 노드와 **같은 500ms 기준**을 쓴다. 그래야 두
-            // 추정기가 같은 순간에 6축으로 떨어져 비교가 성립한다.
+            // 지자기 생존 판정은 구 노드와 **같은 500ms 기준**을 쓴다. 캘리브레이션
+            // 중에는 구 노드와 동일하게 강제 6축 — magneto_cal.py 가 도는 동안
+            // 로봇을 6자세로 뒤집는데, 그 지자기를 낡은(어쩌면 틀린) 계수로 관측에
+            // 쓰면 yaw 를 엉뚱하게 끌고 다닌다. 그 동안 P가 자라므로 복귀는 자동이다.
             const S mag_age = (this->now() - last_mag_time_).seconds();
             const bool stale = mag_age > (mag_timeout_ms_ * 1e-3);
-            set_mag_active(!stale);
+            set_mag_active(!stale && !is_mag_calibrating_);
             if (stale) {
                 flags_ |= 0x20;
                 mag_rej_run_++;
+            } else if (is_mag_calibrating_) {
+                mag_fresh_ = false;   // 캘리브레이션 중에는 소비만 하고 융합하지 않는다
             } else if (mag_fresh_) {
                 mag_fresh_ = false;
                 if (update_mag_yaw(latest_m_, mag_age, w_hat)) { flags_ |= 0x04; mag_rej_run_ = 0; }
@@ -484,6 +862,10 @@ private:
         }
 
         publish();
+
+        // magneto_cal.py 종료 회수 — status 감쇠 주기(~10Hz)에 맞춰 waitpid(WNOHANG).
+        // (tick_ 은 publish() 안에서 매 샘플 증가한다)
+        if (calib_pid_ > 0 && (tick_ % status_divisor_) == 0) poll_mag_calibration();
 
         // 게이트가 오래 걸려 있으면 알린다. 조용히 자이로로만 몇 분을 버티는 게
         // 가장 보기 싫은 실패다.
@@ -777,6 +1159,8 @@ private:
             RCLCPP_INFO(this->get_logger(),
                         "[EKF] 지자기 복귀 -> 9축 (yaw 1sig=%.1f도, 그만큼 빠르게 재획득)",
                         std::sqrt(std::max(0.0, P_(2, 2))) * R2D);
+        } else if (is_mag_calibrating_) {
+            RCLCPP_WARN(this->get_logger(), "[EKF] 지자기 캘리브레이션 중 -> 강제 6축 (완료 시 자동 복귀)");
         } else {
             RCLCPP_WARN(this->get_logger(), "[EKF] 지자기 %dms 무응답 -> 6축 폴백 (yaw 절대 기준 상실)",
                         mag_timeout_ms_);
@@ -832,13 +1216,16 @@ private:
     // =========================================================================
     //  초기화
     // =========================================================================
-    // 기존 노드는 10초간 아무것도 발행하지 않아 모터 출력이 끊긴다(CLAUDE.md 알려진 위험).
-    // 여기서는 그걸 재현하지 않는다:
+    // 구 노드는 10초간 아무것도 발행하지 않아 모터 출력이 끊겼다(블로킹 자이로
+    // 캘리브레이션). 여기서는 그걸 재현하지 않는다:
     //   1) init_samples(0.5초) 평균으로 TRIAD -> 해석적 자세 초기화 후 즉시 발행 시작
     //   2) b_ = 0, 넉넉한 초기 공분산 -> 바이어스가 0에서 수렴하는 곡선 자체가
     //      필터가 동작한다는 1차 증거가 된다
     //   3) 1000샘플 정지 창은 **병렬로** 계속 돌고, 끝나면 유사관측으로 합류한다
     //      (finalize_stationary_window 참조)
+    // 제어 경로가 된 지금도 이 트레이드는 유지한다 — 발행이 ~0.5초에 시작되는 것은
+    // 의도된 개선이다. 대신 바이어스가 수렴하기 전 처음 ~10초는 yaw 가 미세하게
+    // 덜 정확할 수 있다 (roll/pitch 는 가속도가 곧바로 잡아준다).
     //
     // identity로 시작하지 않는 이유: 실제 자세가 30도면 초기 dtheta=0.52 rad로
     // 1차 선형화 영역 밖이고 수렴에 수 초가 걸린다. 가속도가 이미 있는데
@@ -1027,13 +1414,30 @@ private:
         get_euler_angles(&roll, &pitch, &yaw);
         if (!std::isfinite(roll) || !std::isfinite(pitch) || !std::isfinite(yaw)) return;
 
+        // 헤딩 영점(btn2 짧게)에 쓸 원시 yaw 보관. EKF의 get_euler_angles 는 const라
+        // 구 노드처럼 안에서 부수효과로 저장할 수 없으므로 추출 직후 여기서 잡는다.
+        raw_yaw_ = static_cast<float>(yaw);
+
+        // ── 제어 토픽 /filtered/attitude — 구 노드의 인코딩 규약 그대로 ──
+        //   x = roll, 자동 모드면 +5000 (수신 3곳이 |x| > 2500 으로 해독)
+        //   z = yaw - yaw_offset_ 을 ±180도 범위로 1회 되감기 (예: 190도 -> -170도)
+        float filtered_yaw = static_cast<float>(yaw) - yaw_offset_;
+        if (filtered_yaw > 180.0f) filtered_yaw -= 360.0f;
+        else if (filtered_yaw < -180.0f) filtered_yaw += 360.0f;
+
         auto att = geometry_msgs::msg::Vector3();
-        // x는 **순수 roll**이다. 여기에 ±5000 모드 오프셋을 절대 싣지 않는다 —
-        // 제어 소비자가 없고, 실으면 /filtered/attitude 와의 뺄셈 비교가 깨진다.
-        att.x = static_cast<double>(roll);
-        att.y = static_cast<double>(pitch);
-        att.z = static_cast<double>(yaw);    // yaw_offset_ 미적용, 절대값
+        att.x = is_auto_mode_ ? (roll + 5000.0) : roll;
+        att.y = pitch;
+        att.z = static_cast<double>(filtered_yaw);
         attitude_pub_->publish(att);
+
+        // ── 진단 토픽 /filtered/attitude_ekf — 오프셋도 모드 인코딩도 없는 순수값 ──
+        // 비교 스크립트(exp_b.py 등)가 단순 뺄셈으로 쓰므로 이 규약은 유지한다.
+        auto att_ekf = geometry_msgs::msg::Vector3();
+        att_ekf.x = static_cast<double>(roll);
+        att_ekf.y = static_cast<double>(pitch);
+        att_ekf.z = static_cast<double>(yaw);    // yaw_offset_ 미적용, 절대값
+        attitude_ekf_pub_->publish(att_ekf);
 
         // 진단은 10Hz로 솎아 발행한다. 페이로드가 자세 메시지의 4배라
         // 100Hz로 내보내면 사람도 백 분석도 필요 없는 속도로 대역만 먹는다.
@@ -1104,6 +1508,29 @@ private:
     bool  mag_fresh_;     // 이중 계산 방지
     int   mag_far_count_;
 
+    // ---- 버튼 UI / 모드 (구 state_estimation_node 이식) ----
+    bool is_auto_mode_;                    // +5000 인코딩의 근원 (btn1 짧게로 토글)
+    int  btn1_press_count_;
+    int  btn1_counter_; int btn2_counter_; // 눌림 지속 틱 (1틱 = 10ms)
+    int  prev_btn1_; int prev_btn2_;       // 엣지 판정용 직전 상태
+    bool btn1_long_processed_; bool btn2_long_processed_;
+
+    // ---- yaw 영점 (btn2 짧게) ----
+    float raw_yaw_;      // 헤딩 영점 적용 전 원시 yaw [도] — publish()에서 매 샘플 갱신
+    float yaw_offset_;   // btn2 짧게 누름으로 잡은 기준 방향 [도]
+
+    // ---- 압력 서브시스템 (구 노드 이식, 수치 동일) ----
+    bool  press_calibrated_; int press_sample_count_;
+    float press_sum_[3];  float press_offset_[3];
+    float temp_sum_[3];   float temp_offset_[3];
+    float drift_coeff_[3];                        // [N2] 온도 드리프트 계수 — 0 고정 훅
+    int   press_valid_count_[3]; bool press_ch_alive_[3];   // 채널별 유효 샘플 수 / 생존 (N3)
+    rclcpp::Time node_start_time_;   // [N2] 압력 웜업 대기 기준 시각 (재영점 시 갱신 안 함)
+
+    // ---- 지자기 캘리브레이션 (magneto_cal.py 서브프로세스) ----
+    bool  is_mag_calibrating_;   // true 인 동안 강제 6축
+    pid_t calib_pid_;            // 실행 중인 magneto_cal.py 의 pid (-1 = 없음)
+
     // ---- 시간 ----
     bool          have_prev_stamp_;
     rclcpp::Time  t_prev_;
@@ -1122,10 +1549,17 @@ private:
     bool     logged_first_sample_;
 
     // ---- ROS 핸들 ----
-    rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr attitude_pub_;
-    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr status_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr attitude_ekf_pub_;      // /filtered/attitude_ekf (순수값)
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr status_pub_;       // /filtered/ekf_status
+    rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr attitude_pub_;          // /filtered/attitude (제어)
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pressure_cal_pub_; // /sensor/pressure_calibrated
+    rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr ch_imu_pub_;                  // /CH_IMU (검증용)
+    rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr ch_magnet_pub_;         // /CH_MEGNET (검증용)
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr mag_sub_;
+    rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr rc_status_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pressure_sub_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr mag_calib_srv_;
 };
 
 int main(int argc, char **argv) {

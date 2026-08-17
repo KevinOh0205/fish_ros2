@@ -67,7 +67,8 @@ I2C sensors ──▶ i2c_driver_node ──▶ /raw/magnetometer ──▶ stat
 |---|---|
 | `uart_bridge_node` | `/dev/ttyAMA0` 115200 8N1. Byte-level packet state machine. **Pure pass-through — no scaling, no sign flips.** |
 | `i2c_driver_node` | `/dev/i2c-1`: AK8963 magnetometer (via MPU9250 bypass) + 3× MS5837 behind a TCA9548A mux |
-| `state_estimation_node` | Mahony filter, gyro/pressure/mag zeroing, button UI. The "brain". |
+| `state_estimation_node` | **Retired 2026-08-17** — kept in the repo (still built) as the rollback path, but removed from the launch. Mahony reference implementation; never run it alongside the EKF node. |
+| `state_estimation_ekf_node` | MEKF filter, pressure zeroing, button UI, yaw offset, ±5000 mode encoding, mag calibration via `magneto_cal.py`. The "brain" — sole publisher of `/filtered/attitude`. |
 | `pid_control_node` | PID + motor mixing. Output `[0]=left servo, [1]=right servo, [2]=yaw servo, [3]=tail BLDC` |
 | `auto_scenario_node` | Time-based trajectory generator for AUTO mode |
 | `rpm_driver_node` | Hall-sensor pulse counting in a worker thread |
@@ -79,8 +80,9 @@ These are load-bearing and span multiple files. Breaking one silently corrupts b
 
 ### 1. Mode is smuggled inside the attitude message
 
-There is no mode topic. `state_estimation_node` adds **±5000 to `attitude.x` (roll)** when in AUTO
-mode. Three nodes decode it independently with the same `|x| > 2500` test:
+There is no mode topic. `state_estimation_ekf_node` (the encoder moved here from the retired
+`state_estimation_node`, 2026-08-17) adds **±5000 to `attitude.x` (roll)** when in AUTO mode.
+Three nodes decode it independently with the same `|x| > 2500` test:
 
 - `pid_control_node.cpp` `attitude_callback`
 - `auto_scenario_node.cpp` `attitude_callback`
@@ -193,14 +195,16 @@ find this; the earlier "37.8 µT" figure was never the whole offset. Never calib
 
 Two method traps, both hit on 2026-08-06:
 
-- **`min/max` — what btn2 and `/calibrate_mag` do — is worse than no calibration at all.** Not a
+- **`min/max` — what btn2 and `/calibrate_mag` did until 2026-08-17 — is worse than no calibration
+  at all. RETIRED:** both triggers now launch `magneto_cal.py` (ellipsoid fit) from
+  `state_estimation_ekf_node`; the min/max path survives only inside the retired
+  `state_estimation_node`. The evidence stands and is why it was retired — not a
   hypothesis: btn2 was run on 2026-08-06 18:29 in this exact configuration and scored **38.1 %
   scatter against 22.1 % for doing nothing** (row 3 above). It takes two extremes per axis, so any
   hand tumble that misses a true extreme puts the midpoint in the wrong place, and the resulting
   soft-iron scales (0.953/0.953/1.108) then actively distort a field that was at least self-consistent
-  before. Use an ellipsoid fit over all points — `tumble.py` in the session scratchpad.
-  **Every btn2 long press silently overwrites `mag_calib_params.txt`**, so a stray 3 s press can undo
-  a good calibration without any obvious symptom until yaw misbehaves.
+  before. (The old danger — every btn2 long press silently overwriting `mag_calib_params.txt` — is
+  gone with it: `magneto_cal.py` refuses to save above 8 % scatter and backs up the previous file.)
 - **Center the data before fitting the quadric.** `a·x²+…=1` on raw values fails outright (returns
   negative radii) because the cloud sits ~65 µT off the origin, so the squared terms are nearly
   collinear. Subtract the mean, fit, add it back.
@@ -344,10 +348,11 @@ Current contents, written 2026-08-06 from the tumble; the previous file is kept 
 1.046 0.983502 0.973518        # soft iron scale
 ```
 
-The built-in triggers still use the inferior min/max method — prefer `tumble.py`:
+The built-in triggers (btn2 long press, `/calibrate_mag`) run `magneto_cal.py` since 2026-08-17 —
+min/max is retired. On a successful save the EKF node reloads the file automatically (no restart):
 
 ```bash
-ros2 service call /calibrate_mag std_srvs/srv/Trigger    # call twice: start, then finish
+ros2 service call /calibrate_mag std_srvs/srv/Trigger    # call twice: start, then finish early
 ```
 
 ### 9. Button UI (`/rc/status`, 1 tick = 10 ms)
@@ -357,9 +362,9 @@ Short press = 30 ms–1 s; long press = exactly 3 s (`== 300`, fires once).
 | | Short | Long |
 |---|---|---|
 | btn1 | AUTO/MANUAL toggle | re-zero atmospheric pressure |
-| btn2 | set current heading as yaw 0 | start magnetometer calibration |
+| btn2 | set current heading as yaw 0 | run `magneto_cal.py` (ellipsoid); long-press again = finish collection early (SIGINT) |
 
-When the RC link drops the nRF sends `btn = 255`; both `state_estimation_node` and `data_logger_node`
+When the RC link drops the nRF sends `btn = 255`; both `state_estimation_ekf_node` and `data_logger_node`
 explicitly reject non-0/1 values so the `1 → 255` transition isn't misread as a release.
 
 ## Known gaps
@@ -460,7 +465,9 @@ explicitly reject non-0/1 values so the `1 → 255` transition isn't misread as 
   session's clean spin (107°) — see §8's "calibration model is at its limit". A repeat spin test is
   **not** needed to settle that; it is already settled, and the answer is that the sine is environmental.
 - **EKF 6-DOF yaw drift: PASSED 2026-08-07 at +0.155 °/min against the ≤ 2 °/min gate** — the one
-  go/no-go criterion the EKF plan set for itself, and the last thing blocking launch integration.
+  go/no-go criterion the EKF plan set for itself, and the last thing that was blocking launch
+  integration (**done 2026-08-17**: the EKF node is no longer an observer — it owns the control
+  path, and the old node is out of the launch).
   10 min stationary, `use_mag:=false`, first 60 s dropped as the convergence window, 93.8 Hz. Drift is
   steady across the run (+0.19, +0.15, +0.11, +0.22, +0.20, +0.05 °/min over 90 s windows), total
   +1.31° in 9 min, roll/pitch moved 0.08°/0.04°. **The online bias estimate matched the raw stationary

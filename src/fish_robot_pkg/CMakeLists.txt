@@ -69,14 +69,14 @@ ament_target_dependencies(auto_scenario_node rclcpp std_msgs geometry_msgs senso
 target_link_libraries(auto_scenario_node ${M_LIB})
 
 # =================================================================
-# 8. State Estimation EKF Node (신규 - Mahony와 병렬 동작하는 EKF 자세 추정)
+# 8. State Estimation EKF Node (제어 경로 자세 추정 — 구 state_estimation_node 대체)
 # =================================================================
-# std_srvs를 일부러 뺐다. 이 노드는 서비스를 광고하지 않는다 —
-# /calibrate_mag 를 중복 광고하면 어느 서버가 응답할지 정의되지 않으며,
-# 그 핸들러는 보정 파일을 truncate-write 한다. 의존성을 빼두면
-# std_srvs 를 include 하는 순간 컴파일 에러가 나므로 규칙이 강제된다.
+# std_srvs: /calibrate_mag 서비스 소유권이 구 state_estimation_node 에서 이 노드로
+# 이관됐다 (btn2 길게 / 서비스 -> magneto_cal.py 실행). 같은 서비스를 두 노드가
+# 광고하면 어느 서버가 응답할지 정의되지 않으므로 **구 노드와 동시 실행 금지** —
+# launch 에서 구 노드를 뺀 이유이기도 하다 (/filtered/attitude 발행자 중복도 같은 문제).
 add_executable(state_estimation_ekf_node src/state_estimation_ekf_node.cpp)
-ament_target_dependencies(state_estimation_ekf_node rclcpp std_msgs geometry_msgs sensor_msgs)
+ament_target_dependencies(state_estimation_ekf_node rclcpp std_msgs geometry_msgs sensor_msgs std_srvs)
 # ament_target_dependencies 가 plain 시그니처를 쓰므로 여기도 plain 이어야 한다
 # (혼용하면 "The plain signature ... has already been used" 하드 에러).
 target_link_libraries(state_estimation_ekf_node ${M_LIB} Eigen3::Eigen)
