@@ -27,6 +27,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <limits>
 #include <cmath>
 #include <fcntl.h>
@@ -170,7 +173,107 @@ private:
                 }
             }
         }
+
+        verify_port_map();
         return 0;
+    }
+
+    // =========================================================================
+    //  포트 배정 대조 — 어느 커넥터가 어느 역할인지 매 부팅 자동 확인
+    // =========================================================================
+    // 메시지에는 채널 신원 정보가 없다. 배열 위치가 곧 신원이고, 그걸 보증하는
+    // 건 배선뿐이다. 배선이 바뀌면 앞/옆이 뒤바뀐 채로 조용히 큰 음수 동압이
+    // 나오고, 좌/우가 바뀌면 레버암 부호가 뒤집힌다.
+    //
+    // 그래서 저장하는 데이터를 "선언문"이 아니라 **센서 지문(PROM C1~C6)**으로
+    // 한다. 선언문은 하드웨어에 대한 *주장*이라 정비 중에 조용히 거짓이 되지만,
+    // PROM은 센서마다 고유해서 기계가 스스로 대조할 수 있다.
+    // 근거: 2026-08-21 J5를 "접촉 불량"으로 오진했다가 PROM 비교(0x4003.. vs
+    // 0xD001..)로 실은 센서가 교체된 것임이 드러났다.
+    //
+    // ※ PROM이 잡는 것은 **센서 교체**다. 같은 센서에 튜브만 다른 포트로 옮긴
+    //   경우는 못 잡는다 — 그건 압력값으로만 구별되므로 hydro_estimator_node 의
+    //   런타임 감시(주행 중 q_raw 지속 음수 -> 배정 뒤바뀜 의심)가 맡는다.
+    void verify_port_map() {
+        const char *home = getenv("HOME");
+        const std::string path = home ? (std::string(home) + "/ros2_ws/log_csv/port_map.txt")
+                                      : "./log_csv/port_map.txt";
+        static const char *ROLE[3] = {"front", "left", "right"};   // 기본 배정: ch0/ch1/ch2
+
+        std::ifstream in(path);
+        if (!in.is_open()) {
+            // 파일이 없으면 지금 읽은 PROM으로 만들어 둔다. 역할은 **추정값**이므로
+            // verified: no 로 적고, 물리 확인 전까지 매 부팅 경고한다.
+            in.close();
+            FILE *fp = fopen(path.c_str(), "w");
+            if (!fp) {
+                RCLCPP_WARN(this->get_logger(), "[포트] 배정 파일 생성 실패 (%s)", path.c_str());
+                return;
+            }
+            fprintf(fp, "# 포트 배정 및 센서 지문 (MS5837 PROM C1~C6) — i2c_driver_node 가 자동 생성\n");
+            fprintf(fp, "#\n");
+            fprintf(fp, "# verified: no      <- 물리 확인 후 yes 로 바꾸십시오\n");
+            fprintf(fp, "#   앞 확정 : 노즈 포트에 입으로 바람을 불어 그 채널만 오르는지\n");
+            fprintf(fp, "#   좌우 확정: 우현을 아래로 30도 기울여 우 포트가 약 5.8 mbar 높은지\n");
+            fprintf(fp, "#\n");
+            fprintf(fp, "# 역할   채널  C1     C2     C3     C4     C5     C6\n");
+            for (int i = 0; i < 3; i++) {
+                if (prom_C_[i][1] == 0) continue;      // 죽은 채널은 적지 않는다
+                fprintf(fp, "%-7s %d    ", ROLE[i], i);
+                for (int c = 1; c <= 6; c++) fprintf(fp, " %5u", prom_C_[i][c]);
+                fprintf(fp, "\n");
+            }
+            fclose(fp);
+            RCLCPP_WARN(this->get_logger(),
+                        "[포트] 배정 파일을 새로 만들었습니다 (%s). 역할은 **추정값**입니다 — "
+                        "물리 확인 후 verified 를 yes 로 바꾸십시오.", path.c_str());
+            return;
+        }
+
+        bool verified = false, mismatch = false, any = false;
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.find("verified:") != std::string::npos && line.find("yes") != std::string::npos)
+                verified = true;
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream ss(line);
+            std::string role; int ch = -1; unsigned c[7] = {0};
+            if (!(ss >> role >> ch)) continue;
+            if (ch < 0 || ch > 2) continue;
+            bool got = true;
+            for (int k = 1; k <= 6; k++) if (!(ss >> c[k])) { got = false; break; }
+            if (!got) continue;
+            any = true;
+
+            if (prom_C_[ch][1] == 0) {
+                RCLCPP_ERROR(this->get_logger(), "[포트] %s(ch%d) 무응답 — 센서가 죽었거나 빠졌습니다.",
+                             role.c_str(), ch);
+                mismatch = true;
+                continue;
+            }
+            bool same = true;
+            for (int k = 1; k <= 6; k++) if (prom_C_[ch][k] != c[k]) { same = false; break; }
+            if (same) {
+                RCLCPP_INFO(this->get_logger(), "[포트] %s(ch%d) 확인", role.c_str(), ch);
+            } else {
+                RCLCPP_ERROR(this->get_logger(),
+                             "[포트] %s(ch%d) **불일치 — 그 자리 센서가 바뀌었습니다.** "
+                             "기대 C1=%u, 실제 C1=%u", role.c_str(), ch, c[1], prom_C_[ch][1]);
+                mismatch = true;
+            }
+        }
+        in.close();
+
+        if (!any)
+            RCLCPP_WARN(this->get_logger(), "[포트] 배정 파일에 읽을 항목이 없습니다 (%s)", path.c_str());
+        else if (mismatch)
+            RCLCPP_ERROR(this->get_logger(),
+                         "[포트] 배정이 파일과 다릅니다. 수심·속도가 엉뚱한 채널로 계산됩니다 — "
+                         "배선을 확인하거나, 의도한 교체라면 %s 를 지워 다시 만드십시오.", path.c_str());
+        else if (!verified)
+            RCLCPP_WARN(this->get_logger(),
+                        "[포트] 지문은 일치하지만 역할이 물리적으로 확인되지 않았습니다 "
+                        "(%s 의 verified: no).", path.c_str());
     }
 
     // TCA9548A에 비트마스크 1바이트를 써서 해당 채널만 메인 버스에 연결한다.

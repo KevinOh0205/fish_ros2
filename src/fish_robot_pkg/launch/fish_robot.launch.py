@@ -98,4 +98,27 @@ def generate_launch_description():
                 'mag_yaw_sigma': 8.0,
             }]
         ),
+
+        # 8. 수심/속도 추정 노드 — 압력 3채널에서 수심(현재)과 전진 속도(다음 단계)
+        #    출력: /filtered/hydro [depth, speed, q, q_raw, dP_hydro, static, pitch, flags]
+        #    서비스: /hydro/zero_atm (대기압 영점 재포착)
+        #
+        #    ※ 관측 전용이다 — 어떤 제어 루프도 아직 /filtered/hydro 를 구독하지 않는다.
+        #    ※ 수심은 좌우 정압 포트의 산술평균이라 **자세와 무관하게 정확**하다
+        #      (압력이 깊이에 선형이므로 두 점의 평균 = 기하학적 중점의 압력).
+        #      그래서 IMU가 빠져 있어도, 지자기 보정이 없어도 수심은 나온다.
+        #    ※ 포트 역할(front/left/right)은 여기가 아니라 log_csv/port_map.txt 에서
+        #      읽는다. 센서 지문(PROM) 대조와 한 곳에 묶어두기 위해서다.
+        Node(
+            package='fish_robot_pkg',
+            executable='hydro_estimator_node',
+            name='hydro_estimator_node',
+            output='screen',
+            respawn=True,
+            respawn_delay=2.0,
+            parameters=[{
+                'water_density': 997.0,      # 담수 25도. 해수는 1025
+                'atm_warmup_sec': 180.0,     # EKF의 PRESSURE_WARMUP_SEC 과 같은 값
+            }]
+        ),
     ])
