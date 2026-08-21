@@ -5,7 +5,9 @@
 //         이번 단계에서 구현된 것은 수심까지다 — 속도 관련 필드는 NaN으로 나간다.
 //
 //   [입력] /sensor/pressure_raw (Float32MultiArray[6]) 절대압 3채널[mbar] + 온도 3채널[°C], ~11Hz
-//   [출력] /filtered/hydro      (Float32MultiArray[8])  아래 배열 규격 참조
+//          /rc/status          (Int32MultiArray[5])   버튼 (btn1 롱프레스 = 대기압 재영점)
+//   [출력] /filtered/hydro             (Float32MultiArray[8]) 아래 배열 규격 참조
+//          /sensor/pressure_calibrated (Float32MultiArray[3]) 대기압 영점 제거된 게이지압[mbar]
 //   [서비스] /hydro/zero_atm (std_srvs/Trigger)  대기압 영점 재포착
 //
 //  ── 왜 새 노드인가 ──────────────────────────────────────────────────────────
@@ -14,14 +16,25 @@
 //  state_estimation_ekf_node 에 얹지 않은 이유는 그 노드가 이미 1600줄에
 //  자세 경로를 쥐고 있어서다. 수심/속도 필터를 튜닝하다 죽으면 자세까지 죽는다.
 //
-//  ── 왜 /sensor/pressure_calibrated 가 아니라 원시본을 쓰는가 ────────────────
-//  1) EKF의 press_ch_alive_[i] 는 **영구 래치**다. 100샘플 영점 구간에 죽어
-//     있던 채널은 하드웨어가 복구돼도(i2c_driver_node 가 "압력 복구됨"을 찍어도)
-//     btn1 재영점 전까지 영원히 NaN이다. 그 결함을 물려받을 이유가 없다.
-//  2) 보정본은 3열이라 온도가 없다. 2차 온도보상을 나중에 붙일 수 없다.
-//  3) 압력 경로가 자세 경로에 종속되는 방향이 거꾸로다.
-//  대가: 시스템에 대기압 영점이 둘이 된다(여기 것과 EKF 것). 캡처 시각이 달라
-//  수백분의 1 mbar 어긋나는 건 정상이다 — 아래 캡처 로그에 그렇게 적어둔다.
+//  ── 압력 서브시스템 전체를 이 노드가 소유한다 (2026-08-21 이관) ────────────
+//  대기압 영점과 /sensor/pressure_calibrated 는 원래 state_estimation_ekf_node 에
+//  있었다. 거기 있던 이유는 없다 — 2026-08-17 Mahony -> EKF 이관 때 옛 노드의
+//  세간이 통째로 딸려온 것이고, **압력은 EKF 상태벡터에 들어가지도 않는다**
+//  (상태는 쿼터니언과 자이로 바이어스뿐). 같은 프로세스에 세 들어 살던 셈이다.
+//
+//  그대로 뒀다면 같은 일을 하는 영점이 시스템에 둘이 되고, btn1 롱프레스가
+//  둘 중 하나만 다시 잡아 "btn1 길게 = 대기압 재영점" 규약이 절반만 참이 된다.
+//  그래서 영점·발행·버튼을 한 덩어리로 여기로 옮겼다. 얻은 것:
+//    - 영점이 하나다
+//    - EKF의 물속 respawn 버그가 패치가 아니라 삭제로 사라진다 (아래 collect_atm 참조)
+//    - 채널이 죽었다 살아나면 그냥 복구된다 (EKF의 press_ch_alive_ 는 영구 래치였다)
+//    - EKF 노드가 자세만 하게 된다
+//  /sensor/pressure_calibrated 는 토픽 이름·형식·의미를 그대로 유지하므로
+//  data_logger_node(CSV 17~19열)는 손댈 필요가 없다. **발행자는 반드시 하나여야
+//  한다** — EKF 쪽 발행은 같은 커밋에서 제거했다.
+//
+//  원시본(/sensor/pressure_raw)을 입력으로 쓰는 이유는 그 안에 온도가 함께 오기
+//  때문이다. 2차 온도보상을 붙일 자리가 여기 말고는 없다.
 //
 //  ── 수심이 자세와 무관한 이유 (근사가 아니라 정확히) ────────────────────────
 //  압력은 깊이에 선형이므로 **두 정압 포트의 산술평균 = 두 점의 기하학적 중점의
@@ -47,6 +60,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/int32_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include <algorithm>
@@ -95,6 +109,17 @@ public:
 
         hydro_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/filtered/hydro", 10);
 
+        // 구 state_estimation_ekf_node 에서 이관. 규격(3열, 게이지 mbar, 죽은 채널 NaN)
+        // 을 그대로 유지하므로 data_logger_node 는 바뀐 것을 모른다.
+        pressure_cal_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
+            "/sensor/pressure_calibrated", 10);
+
+        // btn1 롱프레스(정확히 3초) = 대기압 재영점. EKF에서 이관했다 —
+        // 버튼을 해석하는 곳이 늘어난 게 아니라 옮겨간 것이다.
+        rc_status_sub_ = this->create_subscription<std_msgs::msg::Int32MultiArray>(
+            "/rc/status", 10,
+            std::bind(&HydroEstimatorNode::rc_status_callback, this, std::placeholders::_1));
+
         zero_atm_srv_ = this->create_service<std_srvs::srv::Trigger>(
             "/hydro/zero_atm",
             std::bind(&HydroEstimatorNode::handle_zero_atm, this,
@@ -119,9 +144,28 @@ private:
         // 즉 1 mbar = 10.23 mm. 이 한 줄이 이 노드의 존재 이유다.
         mbar_per_m_ = rho_ * gravity_ / 100.0;
 
-        // 웜업은 EKF(PRESSURE_WARMUP_SEC=180)와 같은 값으로 둔다. 같은 물리량에
-        // 시스템 안에 다른 숫자가 두 개 생기는 쪽이 더 나쁘고, 어차피 수심만
-        // 기다리는 것이라(속도는 영점이 필요 없다) 기다림의 실제 비용이 없다.
+        // [N2] 대기압 영점 캡처 전 웜업 대기(초). 구 EKF의 PRESSURE_WARMUP_SEC
+        // 이 여기로 왔다 — 근거도 함께 옮긴다.
+        //
+        // 300초였다 -> 180초 (2026-08-20). 300초는 30BA 시절 "ch0 초반 250초
+        // 급강하"를 넘기려고 정한 값인데, 02BA로 교체한 뒤 실측하니 **그 급강하
+        // 자체가 없었다**:
+        //   - 25분 기록에서 t=30초 시점부터 기울기가 이미 ±0.05mbar/분 이내
+        //     (기울기 추정의 잡음 하한 ±0.019와 같은 급)
+        //   - 25분 총 이동량 ch0 -0.08 / ch1 -0.41 / ch2 -0.11 mbar (0.8~4.2mm)
+        //   - 평가 구간을 고정해 캡처 시각만 바꿔보면 180초와 300초의 수심 오차
+        //     차이가 0.03~0.17mm 로, 센서 잡음(0.16mm)과 구분되지 않는다
+        // ch1만 25분 내내 꾸준히 흐르는데, 이건 잦아드는 전이가 아니라서 웜업을
+        // 늘려도 해결되지 않는다(재영점이나 센서 교체로 다뤄야 할 문제다).
+        //
+        // ※ 이 측정은 **최종 조립 전** 상태였다. 하우징이 닫히면 열·기밀 조건이
+        //   달라져 급강하가 되살아날 수 있으므로, 최종 조립 후 press_char.py 로
+        //   재확인할 것. 180초는 그때까지의 안전 마진을 겸한다 (실측상 0초여도
+        //   ch0/ch2는 차이가 없었다).
+        //
+        // ※ 이 기다림이 늦추는 것은 **수심뿐**이다. 속도(피토 차압)는 영점이
+        //   필요 없어 t=0부터 나온다 — 채널별 대기압 오프셋이 차압에 상수로만
+        //   들어가고 그건 물속 q 영점에 흡수되기 때문이다.
         warmup_sec_ = this->declare_parameter<double>("atm_warmup_sec", 180.0);
 
         atm_window_     = this->declare_parameter<int>("atm_window_samples", 101);
@@ -156,7 +200,8 @@ private:
                         atm_offset_[0], atm_offset_[1], atm_offset_[2]);
         }
         RCLCPP_INFO(this->get_logger(), "[Hydro] 출력: /filtered/hydro [depth, speed, q, q_raw, dP_hydro, static, pitch, flags]");
-        RCLCPP_INFO(this->get_logger(), "[Hydro] 서비스: /hydro/zero_atm (대기압 영점 재포착)");
+        RCLCPP_INFO(this->get_logger(), "[Hydro]       /sensor/pressure_calibrated (EKF에서 이관 — 발행자는 반드시 1개)");
+        RCLCPP_INFO(this->get_logger(), "[Hydro] 재영점: btn1 롱프레스 3초, 또는 서비스 /hydro/zero_atm");
         RCLCPP_INFO(this->get_logger(), "=========================================");
     }
 
@@ -418,6 +463,22 @@ private:
         out.data[H_PITCH]    = nan_f;   // 다음 단계
         out.data[H_FLAGS]    = (float)flags;
         hydro_pub_->publish(out);
+
+        // 이관된 /sensor/pressure_calibrated — 영점 포착 전에는 발행하지 않는다.
+        // (구 동작 그대로다. data_logger_node 는 그 구간을 초기값 0.0으로 기록하고,
+        //  docs/csv_format.md 가 그렇게 설명하고 있다.)
+        if (!atm_captured_) return;
+        auto cal = std_msgs::msg::Float32MultiArray();
+        cal.data.resize(3);
+        for (int i = 0; i < 3; i++) {
+            // 죽은 채널은 0.0이 아니라 NaN이다 — 이 토픽에서 0.0은 "수면"이라는
+            // 지극히 정상적인 값이라, 0.0을 센티넬로 쓰면 "버스 사망"과
+            // "수면에 떠 있음"이 같은 값이 된다 (2026-08-20 규약).
+            cal.data[i] = (alive[i] && std::isfinite(atm_offset_[i]))
+                        ? (float)((double)p[i] - (double)atm_offset_[i])
+                        : nan_f;
+        }
+        pressure_cal_pub_->publish(cal);
     }
 
     void watchdog() {
@@ -452,13 +513,41 @@ private:
             res->message = "압력 스트림이 정지 상태입니다.";
             return;
         }
+        start_recapture("서비스");
+        res->success = true;
+        res->message = "재포착 시작 — 결과는 저널에 남습니다. 로봇을 흔들지 마십시오.";
+    }
+
+    // 재포착 진입점 하나 — 서비스와 버튼이 같은 경로를 쓴다.
+    // 웜업을 건너뛴다: 이미 켜져 있던 센서라 예열이 끝났고, 재영점을 누른 사람은
+    // 지금 다시 잡히기를 기대한다.
+    void start_recapture(const char *who) {
         reset_collection();
         force_recapture_ = true;
         atm_captured_    = false;
-        RCLCPP_WARN(this->get_logger(), "[Hydro] 대기압 영점 재포착 시작 (%d샘플, 약 %.0f초)",
-                    atm_window_, atm_window_ / 11.0);
-        res->success = true;
-        res->message = "재포착 시작 — 결과는 저널에 남습니다. 로봇을 흔들지 마십시오.";
+        RCLCPP_WARN(this->get_logger(), "[Hydro] 대기압 영점 재포착 시작 (%s, %d샘플 약 %.0f초) — 로봇을 흔들지 마십시오.",
+                    who, atm_window_, atm_window_ / 11.0);
+    }
+
+    // =========================================================================
+    //  버튼 — btn1 롱프레스(정확히 3초)로 대기압 재영점
+    // =========================================================================
+    // 판정 규칙은 EKF/구 노드와 **똑같이** 맞춘다 (1틱 = 10ms, == 300 에서 1회).
+    // 다르게 두면 같은 버튼이 두 노드에서 다른 시점에 반응한다.
+    void rc_status_callback(const std_msgs::msg::Int32MultiArray::SharedPtr msg) {
+        if (msg->data.empty()) return;
+        const int32_t btn1 = msg->data[0];
+
+        // 링크 두절 시 nRF는 버튼을 255로 보낸다. 1->255 전이를 누름의 연장으로
+        // 오인하지 않도록 0/1 이 아니면 카운터를 중립으로 되돌린다 (N4와 같은 방어).
+        if (btn1 != 0 && btn1 != 1) { btn1_counter_ = 0; return; }
+
+        if (btn1 == 1) {
+            btn1_counter_++;
+            if (btn1_counter_ == 300) start_recapture("버튼1 롱프레스");   // >= 가 아니라 == : 1회만
+        } else {
+            btn1_counter_ = 0;
+        }
     }
 
     // ---- 파라미터 ----
@@ -477,6 +566,7 @@ private:
     bool   force_recapture_ = false;
     std::vector<float> acc_[3];
     int    collect_msgs_    = 0;
+    int    btn1_counter_    = 0;   // 1틱 = 10ms
     double last_warmup_log_ = -1e9;
 
     // ---- 런타임 ----
@@ -486,7 +576,9 @@ private:
     rclcpp::Time node_start_time_, last_press_time_;
 
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pressure_sub_;
+    rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr   rc_status_sub_;
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr    hydro_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr    pressure_cal_pub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                zero_atm_srv_;
     rclcpp::TimerBase::SharedPtr                                      watchdog_timer_;
 };

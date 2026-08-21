@@ -4,7 +4,7 @@
 //  역할 : **제어 경로의 자세 추정기** — 구 state_estimation_node(Mahony)의 완전
 //         대체 (2026-08-17 이관). 자이로를 예측 입력으로, 가속도·지자기를 관측으로
 //         삼아 MEKF로 자세를 추정하고, 구 노드가 쥐고 있던 /filtered/attitude 발행
-//         (±5000 모드 인코딩 + yaw 영점)·버튼 UI·압력 영점·지자기 캘리브레이션
+//         (±5000 모드 인코딩 + yaw 영점)·버튼 UI·지자기 캘리브레이션
 //         트리거까지 전부 승계한다. 이관 근거는 실측이다: 교란 중 기울기 오차
 //         1/2.8 (1.36도 -> 0.49도), 지자기 복구 시 자세 요동 1/54 수준,
 //         6축 yaw 드리프트 +0.155도/분 (합격 기준 2.0도/분 통과).
@@ -12,17 +12,22 @@
 //   [입력] /raw/imu_6dof         (Imu)                  가속도 3축[g] + 각속도 3축[도/초], 100Hz
 //          /raw/magnetometer     (Vector3)              지자기 3축[uT], 95Hz  (use_mag=true일 때만 구독)
 //          /rc/status            (Int32MultiArray[5])   버튼 입력 (1틱 = 10ms)
-//          /sensor/pressure_raw  (Float32MultiArray[6]) 압력 3채널[mbar] + 온도 3채널[°C], ~11Hz
 //   [출력] /filtered/attitude          (Vector3) 자세 + 모드 플래그 — 제어 소비 3곳이 구독
 //                                       x = roll (+5000 = AUTO), y = pitch,
 //                                       z = yaw − yaw_offset_ (±180도 랩)
 //          /filtered/attitude_ekf      (Vector3) 순수 EKF 자세 — 오프셋·인코딩 없음
 //                                       (비교 스크립트 호환 + 진단용으로 그대로 유지)
 //          /filtered/ekf_status        (Float32MultiArray[12]) 진단, 10Hz
-//          /sensor/pressure_calibrated (Float32MultiArray[3])  대기압 영점 제거된 수압
 //          /CH_IMU                     (Imu)     축 변환된 IMU  (검증용, 제어에 미사용)
 //          /CH_MEGNET                  (Vector3) 축 변환된 지자기 (검증용, 제어에 미사용)
 //   [서비스] /calibrate_mag (std_srvs/Trigger)  magneto_cal.py 실행/조기 종료 토글
+//
+//  ※ 압력은 이 노드와 무관하다 (2026-08-21 이관). 대기압 영점,
+//     /sensor/pressure_calibrated 발행, btn1 롱프레스 재영점을 전부
+//     hydro_estimator_node 로 옮겼다. 애초에 여기 있을 이유가 없었다 —
+//     2026-08-17 Mahony -> EKF 이관 때 옛 노드의 세간이 딸려온 것이고,
+//     **압력은 이 필터의 상태벡터에 들어가지도 않는다**(상태는 쿼터니언과
+//     자이로 바이어스뿐). 같은 프로세스에 세 들어 살던 셈이다.
 //
 //  ※ 9축/6축 전환 : 구 노드와 **같은 500ms 워치독**으로 자동 전환한다. 지자기가
 //     살아있으면 9축, 끊기면 6축, 돌아오면 다시 9축. 캘리브레이션 중에도 강제
@@ -100,7 +105,6 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#include <limits>      // quiet_NaN — 죽은 압력 채널 표시
 
 #include <csignal>      // kill(SIGINT) — magneto_cal.py 조기 종료
 #include <sys/wait.h>   // waitpid(WNOHANG) — 서브프로세스 회수
@@ -129,25 +133,6 @@ static constexpr S R2D = 180.0 / M_PI;
 
 #define GYRO_CALIB_SAMPLES 1000   // 100Hz 기준 10초. 기존 노드와 동일한 창 크기
 #define STILLNESS_MAX_RETRY 3     // 정지 판정 실패 시 재시도 횟수
-
-// 압력 영점 (구 state_estimation_node 에서 수치 그대로 이식)
-#define PRESSURE_CALIB_SAMPLES 100   // 압력 11Hz 기준 약 9초
-// [N2] 압력 영점 캡처 전 웜업 대기(초).
-//
-// 300초였다 -> 180초 (2026-08-20). 300초는 30BA 시절 "ch0 초반 250초 급강하"를
-// 넘기려고 정한 값인데, 02BA로 교체한 뒤 실측하니 **그 급강하 자체가 없었다**.
-//   - 25분 기록에서 t=30초 시점부터 기울기가 이미 ±0.05mbar/분 이내
-//     (기울기 추정의 잡음 하한 ±0.019와 같은 급)
-//   - 25분 총 이동량 ch0 -0.08 / ch1 -0.41 / ch2 -0.11 mbar (0.8~4.2mm)
-//   - 평가 구간을 고정해 영점 캡처 시각만 바꿔보면 180초와 300초의 수심 오차 차이가
-//     0.03~0.17mm 로, 센서 잡음(0.16mm)과 구분되지 않는다
-// ch1만 25분 내내 꾸준히 흐르는데, 이건 잦아드는 전이가 아니라서 웜업을 늘려도
-// 해결되지 않는다(재영점이나 센서 교체로 다뤄야 할 문제다).
-//
-// ※ 이 측정은 **최종 조립 전** 상태였다. 하우징이 닫히면 열·기밀 조건이 달라져
-//   급강하가 되살아날 수 있으므로, 최종 조립 후 press_char.py 로 재확인할 것.
-//   180초는 그때까지의 안전 마진을 겸한다 (실측상 0초여도 ch0/ch2는 차이가 없었다).
-#define PRESSURE_WARMUP_SEC 180
 
 // dt 구간 구분 (100Hz 공칭 = 10ms)
 static constexpr S DT_LONG_SEC  = 0.05;   // 5샘플 유실. 여기부터는 로그를 남긴다
@@ -230,8 +215,6 @@ public:
           prev_btn1_(0), prev_btn2_(0),
           btn1_long_processed_(false), btn2_long_processed_(false),
           raw_yaw_(0.0f), yaw_offset_(0.0f),
-          press_calibrated_(false), press_sample_count_(0),
-          node_start_time_(0, 0, RCL_ROS_TIME),
           is_mag_calibrating_(false),
           calib_pid_(-1),
           have_prev_stamp_(false),
@@ -269,7 +252,6 @@ public:
 
         // ── 제어 경로 이관분 (구 state_estimation_node 에서 승계) ──────────────
         attitude_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/filtered/attitude", 10);
-        pressure_cal_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("/sensor/pressure_calibrated", 10);
 
         // 축 변환 검증용 발행 토픽. 필터에 실제로 들어가는 값을 그대로 내보내므로
         // /raw/* 와 나란히 echo 하면 회전이 의도대로 걸렸는지 눈으로 대조할 수 있다.
@@ -281,9 +263,6 @@ public:
         rc_status_sub_ = this->create_subscription<std_msgs::msg::Int32MultiArray>(
             "/rc/status", 10,
             std::bind(&StateEstimationEkfNode::rc_status_callback, this, std::placeholders::_1));
-        pressure_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
-            "/sensor/pressure_raw", 10,
-            std::bind(&StateEstimationEkfNode::pressure_callback, this, std::placeholders::_1));
 
         // 버튼 없이 터미널에서도 지자기 캘리브레이션을 걸 수 있게 서비스로도 노출
         //   ros2 service call /calibrate_mag std_srvs/srv/Trigger   (재호출 = 조기 종료)
@@ -291,18 +270,6 @@ public:
             "/calibrate_mag",
             std::bind(&StateEstimationEkfNode::handle_mag_calibration, this,
                       std::placeholders::_1, std::placeholders::_2));
-
-        // 압력 상태 초기화. 웜업 대기는 노드 기동 시각 기준이라, btn1 길게로
-        // 재영점해도 이 시각은 갱신하지 않는다 (이미 데워진 센서는 즉시 재수집).
-        for (int i = 0; i < 3; i++) {
-            press_sum_[i] = 0.0f;  press_offset_[i] = 0.0f;
-            temp_sum_[i]  = 0.0f;  temp_offset_[i]  = 0.0f;
-            press_valid_count_[i] = 0;  press_ch_alive_[i] = false;
-            // [N2 결론] 드리프트의 원인은 온도가 아니라 웜업 경과 시간(R²≈0.95).
-            // 온도 비례 보정은 무효 + 노이즈 증폭이라 계수 0 고정 훅으로만 남긴다.
-            drift_coeff_[i] = 0.0f;
-        }
-        node_start_time_ = this->now();
 
         // 워치독 기준 시각은 반드시 "지금"으로 잡는다. 기본 생성된 Time(=epoch 0)과
         // 차분하면 첫 메시지 전까지 타임아웃 판정이 엉망이 된다.
@@ -379,7 +346,7 @@ private:
         RCLCPP_INFO(this->get_logger(), "[EKF]   지자기 보정: bias(%.3f %.3f %.3f) scale(%.4f %.4f %.4f)",
                     mag_bias_x_, mag_bias_y_, mag_bias_z_, mag_scale_x_, mag_scale_y_, mag_scale_z_);
         RCLCPP_INFO(this->get_logger(), "[EKF] 출력: /filtered/attitude(제어, ±5000 모드 + yaw 영점), /filtered/attitude_ekf(순수값), /filtered/ekf_status");
-        RCLCPP_INFO(this->get_logger(), "[EKF] 부가: /sensor/pressure_calibrated, /CH_IMU, /CH_MEGNET, 서비스 /calibrate_mag (magneto_cal.py)");
+        RCLCPP_INFO(this->get_logger(), "[EKF] 부가: /CH_IMU, /CH_MEGNET, 서비스 /calibrate_mag (magneto_cal.py)");
         RCLCPP_INFO(this->get_logger(), "[EKF] ※ 구 state_estimation_node 와 동시 실행 금지 — /filtered/attitude 발행자 2개 = PID 200Hz");
         RCLCPP_INFO(this->get_logger(), "=========================================");
     }
@@ -430,14 +397,10 @@ private:
         if (btn1 == 1) {
             btn1_counter_++;
             if (btn1_counter_ == 300) {   // 정확히 300틱(3초)에서 한 번만 발동 (>=가 아니라 ==)
-                btn1_long_processed_ = true;   // 뗄 때 짧은 누름으로 중복 처리되지 않게 표시
-                RCLCPP_WARN(this->get_logger(), "======================================================");
-                RCLCPP_WARN(this->get_logger(), "[EKF] 버튼 1 롱프레스 감지! 대기압 영점을 재조정합니다.");
-                RCLCPP_WARN(this->get_logger(), "======================================================");
-                // 압력 캘리브레이션 상태를 통째로 리셋 -> pressure_callback이 다시 수집 모드로
-                // (웜업 대기는 node_start_time_ 기준이라 이미 지났으면 바로 재수집한다)
-                press_calibrated_ = false; press_sample_count_ = 0;
-                for (int i = 0; i < 3; i++) { press_sum_[i] = 0.0f; temp_sum_[i] = 0.0f; press_valid_count_[i] = 0; }
+                // 대기압 재영점 동작은 hydro_estimator_node 로 이관됐다(2026-08-21).
+                // 여기서는 **감지만** 남긴다 — 이 표시가 없으면 손을 뗄 때 짧은
+                // 누름으로 오인되어 AUTO/MANUAL 이 제멋대로 토글된다.
+                btn1_long_processed_ = true;
             }
         } else {
             if (prev_btn1_ == 1) {   // Falling Edge = 손을 뗀 순간
@@ -584,93 +547,6 @@ private:
         }
         is_mag_calibrating_ = false;
         calib_pid_ = -1;
-    }
-
-    // =========================================================================
-    //  압력 서브시스템 — 구 state_estimation_node 이식 (수치·판정 동일)
-    // =========================================================================
-    // 부팅 후 대기압을 기준(영점)으로 잡고, 이후로는 그 차이만 발행한다.
-    // => 발행값은 사실상 "수심에 의한 게이지 압력"이 된다.
-    void pressure_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
-        if (msg->data.size() < 6) return;
-
-        float raw_p[3] = { msg->data[0], msg->data[1], msg->data[2] };
-        float raw_t[3] = { msg->data[3], msg->data[4], msg->data[5] };
-
-        // ================= [영점 캘리브레이션 단계] =================
-        if (!press_calibrated_) {
-            // [N2] 웜업 대기: 전원 직후 압력이 시간에 따라 크게 드리프트하므로,
-            // 초반 급강하 구간을 지난 뒤에 대기압 영점을 캡처한다.
-            double warmup_elapsed = (this->now() - node_start_time_).seconds();
-            if (warmup_elapsed < PRESSURE_WARMUP_SEC) {
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 30000,
-                    "... 압력 센서 웜업 대기 중 (%.0f / %d초). 이후 영점을 자동 캡처합니다 ...",
-                    warmup_elapsed, PRESSURE_WARMUP_SEC);
-                return;
-            }
-
-            // 채널별로 유효한(>=100mbar) 샘플만 누적한다. 죽었거나 mux 실패로 0이 온
-            // 채널은 건너뛰어, ch0에 의존하지 않고 살아있는 센서만으로 보정을 완료한다.
-            bool any_valid = false;
-            for (int i = 0; i < 3; i++) {
-                if (raw_p[i] >= 100.0f) {
-                    press_sum_[i] += raw_p[i];
-                    temp_sum_[i] += raw_t[i];
-                    press_valid_count_[i]++;
-                    any_valid = true;
-                }
-            }
-            if (!any_valid) return;   // 세 채널 모두 무효면 대기
-
-            press_sample_count_++;
-
-            if (press_sample_count_ % 20 == 0) {
-                RCLCPP_INFO(this->get_logger(), "... 압력 센서 대기압 0점 수집 중 (%d / %d) ...", press_sample_count_, PRESSURE_CALIB_SAMPLES);
-            }
-
-            if (press_sample_count_ >= PRESSURE_CALIB_SAMPLES) {
-                for (int i = 0; i < 3; i++) {
-                    // 절반 이상 유효 샘플이 모인 채널만 살아있는 것으로 인정한다.
-                    if (press_valid_count_[i] >= PRESSURE_CALIB_SAMPLES / 2) {
-                        press_offset_[i] = press_sum_[i] / press_valid_count_[i];   // 대기압 평균 = 영점
-                        temp_offset_[i] = temp_sum_[i] / press_valid_count_[i];     // 영점 캡처 당시 온도
-                        press_ch_alive_[i] = true;
-                    } else {
-                        press_ch_alive_[i] = false;
-                    }
-                }
-                press_calibrated_ = true;
-                RCLCPP_INFO(this->get_logger(), "=========================================");
-                RCLCPP_INFO(this->get_logger(), "[OK] 압력 센서 기준 영점 세팅 완료 (물에 넣으셔도 됩니다)");
-                RCLCPP_INFO(this->get_logger(), "     살아있는 채널: [ch0:%s ch1:%s ch2:%s]",
-                            press_ch_alive_[0] ? "O" : "X", press_ch_alive_[1] ? "O" : "X", press_ch_alive_[2] ? "O" : "X");
-                RCLCPP_INFO(this->get_logger(), "=========================================");
-            }
-            return;
-        }
-
-        // ================= [정상 동작 단계] =================
-        auto cal_msg = std_msgs::msg::Float32MultiArray();
-        cal_msg.data.resize(3);
-        for (int i = 0; i < 3; i++) {
-            if (press_ch_alive_[i]) {
-                // drift_coeff_는 위 N2 결론에 따라 0으로 고정되어 있어 실질적으로 무효항이다.
-                // (온도 보정이 다시 필요해질 때를 위해 구조만 남겨둔 상태)
-                float temp_diff = raw_t[i] - temp_offset_[i];
-                float drift_correction = temp_diff * drift_coeff_[i];
-                cal_msg.data[i] = raw_p[i] - press_offset_[i] - drift_correction;
-            } else {
-                // 죽은 채널은 **NaN** (2026-08-20에 0.0f에서 변경).
-                // 이 토픽은 영점을 뺀 값이라 0.0 = "수면"이라는 정상적인 관측이다.
-                // 0.0으로 표시하면 "센서가 죽었다"와 "수면에 떠 있다"가 같은 값이 되어,
-                // 수심 제어가 잠긴 버스를 수면으로 읽고 계속 잠수를 시도하게 된다.
-                // NaN은 어떤 정상값과도 겹치지 않고, 계산에 전염되어 확인을 빼먹은
-                // 소비자도 조용히 틀리는 대신 눈에 띄게 망가진다.
-                // 소비자는 std::isnan()으로 확인할 것 (x == NAN 은 항상 false).
-                cal_msg.data[i] = std::numeric_limits<float>::quiet_NaN();
-            }
-        }
-        pressure_cal_pub_->publish(cal_msg);
     }
 
     // =========================================================================
@@ -1540,14 +1416,6 @@ private:
     float raw_yaw_;      // 헤딩 영점 적용 전 원시 yaw [도] — publish()에서 매 샘플 갱신
     float yaw_offset_;   // btn2 짧게 누름으로 잡은 기준 방향 [도]
 
-    // ---- 압력 서브시스템 (구 노드 이식, 수치 동일) ----
-    bool  press_calibrated_; int press_sample_count_;
-    float press_sum_[3];  float press_offset_[3];
-    float temp_sum_[3];   float temp_offset_[3];
-    float drift_coeff_[3];                        // [N2] 온도 드리프트 계수 — 0 고정 훅
-    int   press_valid_count_[3]; bool press_ch_alive_[3];   // 채널별 유효 샘플 수 / 생존 (N3)
-    rclcpp::Time node_start_time_;   // [N2] 압력 웜업 대기 기준 시각 (재영점 시 갱신 안 함)
-
     // ---- 지자기 캘리브레이션 (magneto_cal.py 서브프로세스) ----
     bool  is_mag_calibrating_;   // true 인 동안 강제 6축
     pid_t calib_pid_;            // 실행 중인 magneto_cal.py 의 pid (-1 = 없음)
@@ -1573,13 +1441,11 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr attitude_ekf_pub_;      // /filtered/attitude_ekf (순수값)
     rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr status_pub_;       // /filtered/ekf_status
     rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr attitude_pub_;          // /filtered/attitude (제어)
-    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pressure_cal_pub_; // /sensor/pressure_calibrated
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr ch_imu_pub_;                  // /CH_IMU (검증용)
     rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr ch_magnet_pub_;         // /CH_MEGNET (검증용)
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr mag_sub_;
     rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr rc_status_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pressure_sub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr mag_calib_srv_;
 };
 

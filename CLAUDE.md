@@ -43,7 +43,11 @@ nRF52840 ──UART 46B──▶ uart_bridge_node ──▶ /raw/imu_6dof ──
                               │                /rc/status ───┤
                               │                              ▼
 I2C sensors ──▶ i2c_driver_node ──▶ /raw/magnetometer ──▶ state_estimation_ekf_node
-                                    /sensor/pressure_raw          │
+                        │                                         │
+                        └─ /sensor/pressure_raw ──▶ hydro_estimator_node
+                                                     │  /filtered/hydro (depth[m], flags)
+                                                     └─ /sensor/pressure_calibrated ──┐
+                                                                                      │
                                                                   ▼
                                                         /filtered/attitude
                                                           │       │       │
@@ -64,11 +68,12 @@ I2C sensors ──▶ i2c_driver_node ──▶ /raw/magnetometer ──▶ stat
 |---|---|
 | `uart_bridge_node` | `/dev/ttyAMA0` 115200 8N1. Byte-level packet state machine. **Pure pass-through — no scaling, no sign flips.** |
 | `i2c_driver_node` | `/dev/i2c-1`: AK8963 magnetometer (via MPU9250 bypass) + 3× MS5837 behind a TCA9548A mux |
-| `state_estimation_ekf_node` | MEKF filter, pressure zeroing, button UI, yaw offset, ±5000 mode encoding, mag calibration via `magneto_cal.py`. The "brain" — sole publisher of `/filtered/attitude`. |
+| `state_estimation_ekf_node` | MEKF filter, button UI, yaw offset, ±5000 mode encoding, mag calibration via `magneto_cal.py`. The "brain" — sole publisher of `/filtered/attitude`. **Pressure left this node on 2026-08-21** — it never entered the filter state; it was inherited furniture from the Mahony migration. |
 | `state_estimation_node` | **Retired 2026-08-17** — kept in the repo (still built) as the rollback path, removed from the launch. Mahony reference; never run it alongside the EKF node. |
 | `pid_control_node` | PID + motor mixing. Output `[0]=left servo, [1]=right servo, [2]=yaw servo, [3]=tail BLDC` |
 | `auto_scenario_node` | Time-based trajectory generator for AUTO mode |
 | `rpm_driver_node` | Hall-sensor pulse counting in a worker thread |
+| `hydro_estimator_node` | **Owns pressure end to end** (new 2026-08-21): atmospheric zeroing, `/sensor/pressure_calibrated`, btn1 long-press re-zero, and depth in metres on `/filtered/hydro`. Speed (pitot) is the next stage — those array slots publish NaN today. Observation-only; no control loop consumes it. |
 | `data_logger_node` | 39-column CSV snapshot at 100 Hz — fused attitude **plus raw IMU/mag/pressure and EKF gyro bias + flags** (post-hoc diagnosis; raw mag enables offline recalibration, raw pressure enables offline depth/pitot recomputation). 200 MB per-file rotation, `Time(s)` continuous across files. Schema: `docs/csv_format.md`. |
 
 ## Conventions you must know before editing
@@ -124,10 +129,16 @@ clamp events, because its fixed `Kp·dt` correction step must stay bounded. §1.
 
 ### 6. Startup is not instantaneous
 
-- **Gyro calibration blocks for ~10 s** (1000 samples); nothing publishes, so no motor output. The
-  robot must be completely still — handling it in this window poisons the bias for the whole session.
-- **Pressure zeroing waits 180 s** (`PRESSURE_WARMUP_SEC`, cut from 300 s on 2026-08-20) before
-  capturing baseline. The 300 s figure sized a 30BA-era steep initial drop (~250 s); with 02BA
+- **The gyro-bias stillness window is 1000 samples (~10 s), but it does NOT block.** The EKF
+  initialises on 50 samples (~0.5 s) and publishes attitude from then on; the 1000-sample window runs
+  **in parallel** and joins as a pseudo-measurement when it closes (`state_estimation_ekf_node.cpp:1245`).
+  The robot must still be completely still for those 10 s — motion trips the stillness test
+  (`자이로 std < 1.0 °/s` and `|a|` deviation `< 0.05 g`) and restarts the window, up to 3 times.
+  The old "blocks for 10 s, nothing publishes" behaviour was the **retired Mahony node's**.
+- **Pressure zeroing waits 180 s** (`atm_warmup_sec` in `hydro_estimator_node`, cut from 300 s on
+  2026-08-20) before capturing baseline. It delays **depth only** — pitot speed needs no atmospheric
+  zero (the per-channel offsets enter the differential as a constant and are absorbed by the in-water
+  q zero), so it will publish from t=0 once implemented. The 300 s figure sized a 30BA-era steep initial drop (~250 s); with 02BA
   sensors **that transient is absent** — slopes sit inside the estimator's own noise floor from
   t=30 s, and 180 s vs 300 s changes the resulting depth error by 0.03–0.17 mm, below sensor noise.
   Re-verify after final assembly (`press_char.py --s1`); a sealed housing may bring the transient back.
@@ -199,7 +210,7 @@ Short press = 30 ms–1 s; long press = exactly 3 s (`== 300`, fires once).
 
 | | Short | Long |
 |---|---|---|
-| btn1 | AUTO/MANUAL toggle | re-zero atmospheric pressure |
+| btn1 | AUTO/MANUAL toggle | re-zero atmospheric pressure (**handled by `hydro_estimator_node`** since 2026-08-21; the EKF still detects the 3 s hold, but only to suppress the release from counting as a short press) |
 | btn2 | set current heading as yaw 0 | run `magneto_cal.py` (ellipsoid); long-press again = finish collection early (SIGINT) |
 
 When the RC link drops the nRF sends `btn = 255`; both `state_estimation_ekf_node` and
