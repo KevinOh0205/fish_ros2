@@ -38,26 +38,27 @@ Everything is a **100 Hz (10 ms) loop**. Data flows one direction with no feedba
 command returning to the MCU:
 
 ```
-nRF52840 ──UART 46B──▶ uart_bridge_node ──▶ /raw/imu_6dof ──┐
-                              ▲                /rc/command   │
-                              │                /rc/status ───┤
-                              │                              ▼
+nRF52840 ──UART 46B──▶ uart_bridge_node ──▶ /raw/imu_6dof ─┐
+                              ▲                /rc/command  │
+                              │                /rc/status ──┤
+                              │                             ▼
 I2C sensors ──▶ i2c_driver_node ──▶ /raw/magnetometer ──▶ state_estimation_ekf_node
-                        │                                         │
-                        └─ /sensor/pressure_raw ──▶ hydro_estimator_node
-                                                     │  /filtered/hydro (depth[m], flags)
-                                                     └─ /sensor/pressure_calibrated ──┐
-                                                                                      │
-                                                                  ▼
-                                                        /filtered/attitude
-                                                          │       │       │
-                              ┌───────────────────────────┘       │       └──▶ data_logger_node
-                              ▼                                   ▼                  │
-                     auto_scenario_node ──/auto/command──▶ pid_control_node           ▼
-                                                                  │            log_csv/*.csv
-                              └──────────/motor/output────────────┘
-                                             │
-                                   uart_bridge_node ──UART 10B──▶ nRF52840
+                        │                                            │
+                        │                                            ▼
+                        │                                  /filtered/attitude
+                        │                                    │      │       │
+                        │        ┌───────────────────────────┘      │       └──┐
+                        │        ▼                                  ▼          │
+                        │ auto_scenario_node ─/auto/command─▶ pid_control_node  │
+                        │                                           │          │
+                        │        └─────────/motor/output────────────┘          │
+                        │                       │                              │
+                        │             uart_bridge_node ─UART 10B─▶ nRF52840     │
+                        │                                                      ▼
+                        └─ /sensor/pressure_raw ──▶ hydro_estimator_node ─▶ data_logger_node
+                                    (+ /rc/status)      /filtered/hydro            │
+                                                        /sensor/pressure_calibrated   ▼
+                                                                            log_csv/*.csv
 ```
 
 `rpm_driver_node` is independent: GPIO 21 rising-edge interrupts → `/sensor/tail_rpm`.
