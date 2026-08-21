@@ -122,8 +122,15 @@ transmitter is the normal case.
 ### 5. The control loop is event-driven, not timed
 
 `pid_control_node` has **no timer** — PID runs inside `attitude_callback`, and it **omits `dt`**
-(gains absorb it, assuming a fixed 100 Hz). If the attitude rate ever changes, the gains are wrong —
-one reason `/filtered/attitude` must only ever have ONE publisher (ghost-publisher check below).
+(gains absorb it, assuming a fixed 100 Hz). `/filtered/attitude` must only ever have ONE publisher
+(ghost-publisher check below) — but be precise about *why*, because the obvious reason is currently
+false: **`ki` and `kd` are all `0.0f`** (`pid_control_node.cpp:39-41`), so P-only control is
+rate-independent and doubling the attitude rate does **not** change the servo command. The real
+damage from two publishers is (1) two different estimators' attitudes arriving alternately, so the
+output chatters between two values, and (2) `/motor/output` doubling to 200 Hz, which doubles the
+UART packet rate to the nRF. The `dt`-omission gain problem becomes real **the moment I or D is
+enabled** — which is exactly when someone will least expect it. Telling an operator "the gains are
+wrong" today sends them to re-tune gains that are fine.
 `state_estimation_ekf_node` measures `dt` per sample from `header.stamp` and integrates it with no
 upper clamp (covariance adjusts trust); the retired Mahony node clamps to `[0.001, 0.1]` s and logs
 clamp events, because its fixed `Kp·dt` correction step must stay bounded. §1.3.
