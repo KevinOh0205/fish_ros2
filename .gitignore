@@ -1,7 +1,9 @@
 # ROS2 colcon build artifacts
-/build/
-/install/
-/log/
+# 앞에 / 를 붙이지 않는다 — 워크스페이스 루트가 아닌 곳에서 colcon 을 돌리면
+# 거기에도 build/install/log 가 생기는데, 루트 고정 패턴은 그걸 못 잡는다.
+build/
+install/
+log/
 
 # Runtime data logs
 /log_csv/
