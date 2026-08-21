@@ -100,6 +100,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <limits>      // quiet_NaN — 죽은 압력 채널 표시
 
 #include <csignal>      // kill(SIGINT) — magneto_cal.py 조기 종료
 #include <sys/wait.h>   // waitpid(WNOHANG) — 서브프로세스 회수
@@ -659,7 +660,14 @@ private:
                 float drift_correction = temp_diff * drift_coeff_[i];
                 cal_msg.data[i] = raw_p[i] - press_offset_[i] - drift_correction;
             } else {
-                cal_msg.data[i] = 0.0f;   // 죽은 채널은 0으로 표시
+                // 죽은 채널은 **NaN** (2026-08-20에 0.0f에서 변경).
+                // 이 토픽은 영점을 뺀 값이라 0.0 = "수면"이라는 정상적인 관측이다.
+                // 0.0으로 표시하면 "센서가 죽었다"와 "수면에 떠 있다"가 같은 값이 되어,
+                // 수심 제어가 잠긴 버스를 수면으로 읽고 계속 잠수를 시도하게 된다.
+                // NaN은 어떤 정상값과도 겹치지 않고, 계산에 전염되어 확인을 빼먹은
+                // 소비자도 조용히 틀리는 대신 눈에 띄게 망가진다.
+                // 소비자는 std::isnan()으로 확인할 것 (x == NAN 은 항상 false).
+                cal_msg.data[i] = std::numeric_limits<float>::quiet_NaN();
             }
         }
         pressure_cal_pub_->publish(cal_msg);

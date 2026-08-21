@@ -27,6 +27,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <limits>
+#include <cmath>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>   // I2C_SLAVE ioctl
@@ -258,10 +260,14 @@ private:
                         uint8_t adc_cmd = 0x00;   // ADC Read: 24bit 결과를 3바이트로 회수
                         if (write(i2c_fd_, &adc_cmd, 1) == 1 && read(i2c_fd_, adc_buf, 3) == 3) {
                             D1[i] = ((uint32_t)adc_buf[0] << 16) | ((uint32_t)adc_buf[1] << 8) | adc_buf[2];
+                        } else {
+                            D1[i] = 0;   // [필수] 실패 시 반드시 무효화 — 아래 주석 참조
                         }
                         // 이어서 온도 데이터(D2) 변환 명령 하향
                         uint8_t d2_cmd = 0x5A;   // D2(온도) 변환 시작, OSR=8192
                         if (write(i2c_fd_, &d2_cmd, 1) < 0) { /* 경고 제어용 */ }
+                    } else {
+                        D1[i] = 0;
                     }
                 }
                 state = 2; delay_counter = 0;
@@ -271,17 +277,43 @@ private:
             // 변환 대기 (약 40ms 안정 확보)
             if (++delay_counter >= 4) {
                 auto out_pressure_msg = std_msgs::msg::Float32MultiArray();
-                out_pressure_msg.data.resize(6); // [0..2]: 원시 압력값(mbar), [3..5]: 원시 온도값(C)
-                // resize는 0으로 채우므로, 죽은 채널은 0.0인 채로 나간다.
-                // 하류(state_estimation)는 100mbar 미만을 무효로 간주해 이 규약과 맞물린다.
+                // [0..2] 압력(mbar), [3..5] 온도(C).
+                //
+                // **데이터 없음은 0.0이 아니라 NaN이다** (2026-08-20 변경).
+                // 전에는 resize가 채운 0.0이 그대로 나갔는데, 영점을 뺀 하류
+                // (/sensor/pressure_calibrated)에서 0.0은 "수면"이라는 지극히 정상적인
+                // 값이라 **버스가 죽은 것과 수면에 떠 있는 것이 구분되지 않았다**.
+                // 수심 제어가 붙으면 잠긴 버스를 "수면"으로 읽고 계속 잠수를 시도하게 된다.
+                //
+                // NaN을 쓰는 이유:
+                //   - 어떤 정상값과도 겹치지 않는다 (수심 0이든 -5든 NaN은 아니다)
+                //   - 모든 비교가 false라 기존 ">= 100mbar" 유효성 검사에 그대로 걸린다
+                //     (하류를 한 줄도 안 고쳐도 무효 판정이 유지된다)
+                //   - 계산에 전염된다. 확인을 빼먹은 소비자도 조용히 틀린 답을 내는 대신
+                //     결과가 NaN이 되어 눈에 띄게 망가진다
+                //   - CSV에 "nan"으로 남아 사후 분석에서 결측이 자동 구분된다
+                // 확인은 반드시 std::isnan(x) 로 한다. NaN은 자기 자신과도 같지 않아
+                // x == NAN 은 **항상 false**다.
+                out_pressure_msg.data.assign(6, std::numeric_limits<float>::quiet_NaN());
 
                 for (int i = 0; i < 3; i++) {
                     if (prom_C_[i][1] == 0) continue;
-                    if (!select_mux_channel_retry(i)) continue;
+                    // [필수] 어떤 경로로 실패하든 D1/D2를 0으로 무효화한다.
+                    //
+                    // D1/D2는 static이라 갱신에 실패하면 **직전 성공값이 그대로 남는다**.
+                    // 예전에는 그 상태로 환산이 돌아, 센서를 뽑아도 마지막 값이 소수점까지
+                    // 똑같이 계속 발행됐다 (2026-08-21 실측: J5를 뽑았는데 1005.7000이
+                    // 8샘플 연속 동일. 살아있는 채널은 잡음으로 매번 달랐다).
+                    // 0.0이나 NaN보다 훨씬 위험하다 — 완벽하게 정상으로 보이기 때문이다.
+                    // 잠수 중에 센서가 죽으면 수심이 그 값에 얼어붙고 아무도 모른다.
+                    // 0은 아래 환산 가드가 무효로 걸러내고, 결국 NaN으로 발행된다.
+                    if (!select_mux_channel_retry(i)) { D2[i] = 0; continue; }
                     if (ioctl(i2c_fd_, I2C_SLAVE, MS5837_ADDR) >= 0) {
                         uint8_t adc_cmd = 0x00;
                         if (write(i2c_fd_, &adc_cmd, 1) == 1 && read(i2c_fd_, adc_buf, 3) == 3) {
                             D2[i] = ((uint32_t)adc_buf[0] << 16) | ((uint32_t)adc_buf[1] << 8) | adc_buf[2];
+                        } else {
+                            D2[i] = 0;
                         }
 
                         // 0xFFFFFF(통신 실패)와 0(미수거)은 환산에서 제외
@@ -344,9 +376,42 @@ private:
 
                             out_pressure_msg.data[i] = filtered_P[i];           // 압력 채널 0,1,2 (mbar)
                             out_pressure_msg.data[i + 3] = TEMP / 100.0f;       // 온도 채널 0,1,2 (C)
+                        } else {
+                            // 환산 불가 — 이 채널은 NaN인 채로 나간다. 다음 사이클이
+                            // 깨끗하게 시작되도록 첫 샘플 플래그도 되돌린다.
+                            first_read[i] = true;
                         }
+                    } else {
+                        D2[i] = 0;
                     }
                 }
+                // 연속 실패 감지. 예전에는 먹스 선택 실패도 ADC 읽기 실패도 로그 없이
+                // 지나가서, 버스가 잠겨도 저널만 봐서는 알 수 없었다 (2026-08-20 실측:
+                // t=42~45초 3초 결측이 아무 흔적도 남기지 않았다).
+                int alive_now = 0;
+                for (int i = 0; i < 3; i++)
+                    if (std::isfinite(out_pressure_msg.data[i])) alive_now++;
+
+                if (alive_now == 0) {
+                    if (++press_fail_streak_ == 30) {          // 약 3초 (11Hz 기준)
+                        RCLCPP_ERROR(this->get_logger(),
+                            "[MS5837] 전 채널 %d사이클 연속 실패 — I2C 버스 잠김 의심. "
+                            "압력은 NaN으로 발행 중(수심 0이 아님). 전원 재인가가 필요할 수 있음.",
+                            press_fail_streak_);
+                    } else if (press_fail_streak_ > 30 && press_fail_streak_ % 300 == 0) {
+                        RCLCPP_ERROR(this->get_logger(),
+                            "[MS5837] 전 채널 실패 지속 (%d사이클, 약 %d초).",
+                            press_fail_streak_, press_fail_streak_ / 11);
+                    }
+                } else {
+                    if (press_fail_streak_ >= 30) {
+                        RCLCPP_WARN(this->get_logger(),
+                            "[MS5837] 압력 복구됨 (%d사이클 만에, 살아있는 채널 %d개).",
+                            press_fail_streak_, alive_now);
+                    }
+                    press_fail_streak_ = 0;
+                }
+
                 pressure_pub_->publish(out_pressure_msg);
                 state = 0;   // 다음 사이클 시작
             }
@@ -354,6 +419,7 @@ private:
     }
 
     int i2c_fd_;
+    int press_fail_streak_ = 0;   // 압력 전 채널 연속 실패 사이클 수 (버스 잠김 감지)
     bool has_mag_;
     uint16_t prom_C_[3][8];   // [채널][PROM 워드] — [1]이 0이면 "해당 채널 사용 불가" 마커
     rclcpp::TimerBase::SharedPtr i2c_timer_;

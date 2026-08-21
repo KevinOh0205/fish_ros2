@@ -96,6 +96,14 @@ matter to them, only direction. **Any new consumer of this topic must convert.**
 - `/rc/status` is `Int32MultiArray[5]` = `[btn1, btn2, vbat1×100, vbat2×100, rssi]`. Voltages are
   centivolts — divide by 100.
 - `/sensor/pressure_raw` is `Float32MultiArray[6]`: `[0..2]` pressure (mbar), `[3..5]` temperature (°C).
+  **A dead channel is `NaN`, never `0.0`** (changed 2026-08-20, same on `/sensor/pressure_calibrated`).
+  On the zeroed topic `0.0` is a legitimate reading — *at the surface* — so the old `0.0` sentinel made
+  "bus is dead" and "floating at the surface" the same value, and a depth loop would keep diving on a
+  locked bus. NaN collides with nothing, still fails the existing `>= 100 mbar` validity test (every
+  comparison with NaN is false, so downstream needed no change), and propagates through arithmetic so
+  a consumer that forgets to check breaks loudly instead of quietly. **Test with `std::isnan(x)` —
+  `x == NAN` is always false.** `i2c_driver_node` also logs an ERROR after 30 consecutive all-channel
+  failures (~3 s), because the mux-select and ADC-read failure paths used to be silent.
 
 ### 4. `-9999` is the RC-link-lost sentinel
 
