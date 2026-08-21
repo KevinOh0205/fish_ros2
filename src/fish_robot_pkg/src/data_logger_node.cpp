@@ -5,7 +5,7 @@
 //
 //   [입력] /filtered/attitude          (Vector3)             자세 + 모드 플래그
 //          /sensor/pressure_calibrated (Float32MultiArray[3]) 영점 보정된 압력
-//          /sensor/pressure_raw        (Float32MultiArray[6]) 원시 온도([3..5])만 사용
+//          /sensor/pressure_raw        (Float32MultiArray[6]) 원시 절대압[0..2] + 온도[3..5]
 //          /rc/command                 (Quaternion)          조종기 스틱
 //          /rc/status                  (Int32MultiArray[5])  버튼/배터리/RSSI
 //          /motor/output               (UInt16MultiArray[4]) 최종 모터 출력
@@ -22,7 +22,7 @@
 //  원시값 3종을 상시 기록하는 이유(2026-08-18): 물속 운용은 재현이 안 된다.
 //  융합 결과만 남으면 자세 이상이 "센서 탓인지 필터 탓인지" 사후 규명이 불가능하다.
 //
-//  ※ 크기: 100Hz x 36컬럼 ≈ 시간당 80MB. 파일당 200MB(약 2.5시간)에서 새 파일로
+//  ※ 크기: 100Hz x 39컬럼 ≈ 시간당 84MB. 파일당 200MB(약 2.4시간)에서 새 파일로
 //     회전하며, Time(s) 축은 회전을 넘어 이어진다(기동 시각 기준 유지). 오래된
 //     파일은 지우지 않는다 — log_csv/에는 실험 CSV와 지자기 보정 파일이 같이
 //     살므로 자동 삭제는 위험하다. 총량 관리는 사람 몫.
@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <limits>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -70,6 +71,14 @@ public:
         rpm_ = 0;
         p0_cal_ = 0.0f; p1_cal_ = 0.0f; p2_cal_ = 0.0f;
         t0_ = 0.0f; t1_ = 0.0f; t2_ = 0.0f;
+        // 원시 절대압은 0.0이 아니라 NaN으로 시작한다. 대기압은 ~1013mbar라 0.0이
+        // 물리적으로 불가능하긴 하지만, 드라이버가 죽은 채널을 NaN으로 표시하므로
+        // (i2c_driver_node.cpp:282-296) "아직 안 받음"도 같은 표기로 두어야
+        // 분석 스크립트가 한 가지 규칙(isnan)만 알면 되게 한다.
+        {
+            const float nan_f = std::numeric_limits<float>::quiet_NaN();
+            p0_raw_ = nan_f; p1_raw_ = nan_f; p2_raw_ = nan_f;
+        }
         rssi_ = 0;
         ax_ = 0.0f; ay_ = 0.0f; az_ = 0.0f;             // 원시 가속도 [g]
         gx_ = 0.0f; gy_ = 0.0f; gz_ = 0.0f;             // 원시 자이로 [도/초]
@@ -87,7 +96,9 @@ public:
         pressure_cal_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
             "/sensor/pressure_calibrated", 10, std::bind(&DataLoggerNode::pressure_cal_callback, this, std::placeholders::_1));
 
-        // 압력 영점 음의 드리프트(N2) 진단용 원시 온도 로깅. [3..5]가 채널별 온도(C).
+        // 원시 압력([0..2] 절대압 mbar)과 원시 온도([3..5] C)를 함께 기록한다.
+        // 원시 압력은 수심·속도(피토 차압)를 사후에 다시 계산하기 위한 원본이다 —
+        // 보정본(P*_cal)은 EKF가 잡은 영점이 이미 빠져 있어 역산이 되지 않는다.
         pressure_raw_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
             "/sensor/pressure_raw", 10, std::bind(&DataLoggerNode::pressure_raw_callback, this, std::placeholders::_1));
 
@@ -151,8 +162,9 @@ private:
         fp_ = fopen(file_path, "w");
         if (fp_ == nullptr) return -1;
 
-        // 새 컬럼은 반드시 기존 23컬럼 "뒤에" 덧붙인다 — 열 번호로 읽는 기존
+        // 새 컬럼은 반드시 기존 컬럼 "뒤에" 덧붙인다 — 열 번호로 읽는 기존
         // 분석 스크립트(예전 C 펌웨어 규격 포함)가 깨지지 않게 하는 규칙이다.
+        // 현재 36컬럼까지가 고정 구간이고, 37열부터가 이번 확장분이다.
         // AX..AZ[g], GX..GZ[도/초] — nRF 원시 규약 그대로 (REP-103 아님)
         // MX..MZ[µT] — 보정 전 칩 축. 원시로 남겨야 나중에 새 보정 계수를
         //              오프라인으로 다시 적용할 수 있다 (보정 후 값은 역산 불가)
@@ -161,8 +173,13 @@ private:
         //    원시 자이로에서 바이어스를 직접 빼면 틀린다 — 칩→몸체 변환
         //    (bx,by,bz) = (-gz, -gx, +gy) 를 거친 뒤 빼야 한다 (실측 대조 완료:
         //    BiasZ -3.06 이 원시 GY -3.0 에 대응).
+        // P0_raw..P2_raw[mbar] — 영점 전 절대압. 보정본(P0_cal..)과 나란히 있어야
+        //    (원시 - 보정) = EKF가 잡은 대기압 영점이 사후에 그대로 복원된다.
+        //    수심·피토 차압을 나중에 다른 상수로 다시 계산하려면 이 원본이 필요하다.
+        //    죽은 채널은 nan으로 찍힌다 (0.0 아님).
         fprintf(fp_, "Time(s),Btn1_Count,Mode,AutoMode,Roll,Pitch,Yaw,RC_T,RC_R,RC_P,RC_Y,M1,M2,M3,M4,RPM,P0_cal,P1_cal,P2_cal,T0,T1,T2,RSSI,"
-                     "AX,AY,AZ,GX,GY,GZ,MX,MY,MZ,BiasX,BiasY,BiasZ,EKF_Flags\n");
+                     "AX,AY,AZ,GX,GY,GZ,MX,MY,MZ,BiasX,BiasY,BiasZ,EKF_Flags,"
+                     "P0_raw,P1_raw,P2_raw\n");
         fflush(fp_);   // 헤더는 즉시 기록해 파일이 비어 보이지 않게 한다
 
         return 0;
@@ -204,9 +221,14 @@ private:
         p2_cal_ = msg->data[2];
     }
 
-    // 원시 압력 토픽의 온도 채널([3..5])만 뽑아 저장한다 (압력 드리프트 진단용).
+    // 원시 압력 토픽: [0..2] 절대압(mbar, 영점 전), [3..5] 채널별 온도(C).
+    // 죽은 채널은 드라이버가 NaN으로 채워 보내므로 그대로 통과시킨다 — 여기서
+    // 거르면 CSV에서 "고장"과 "정상적으로 0"을 구별할 수 없게 된다.
     void pressure_raw_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
         if (msg->data.size() < 6) return;
+        p0_raw_ = msg->data[0];
+        p1_raw_ = msg->data[1];
+        p2_raw_ = msg->data[2];
         t0_ = msg->data[3];
         t1_ = msg->data[4];
         t2_ = msg->data[5];
@@ -322,8 +344,11 @@ private:
         // btn1_cumulative_count_ 를 기록합니다.
         // 자릿수: 가속도/바이어스 %.4f (바이어스 불안정성 실측이 0.001도/초 수준),
         //         자이로 %.3f, 지자기 %.2f (노이즈 ~0.1µT 아래는 의미 없음)
+        //         원시 압력 %.3f — 0.001mbar = 수심 0.01mm. 실측 잡음이 0.13mbar라
+        //         기존 %.2f로도 버티지만, 사후 재계산의 원본이라 잘라 둘 이유가 없다.
         fprintf(fp_, "%.3f,%d,%d,%d,%.2f,%.2f,%.2f,%d,%d,%d,%d,%u,%u,%u,%u,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,"
-                     "%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%d\n",
+                     "%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%d,"
+                     "%.3f,%.3f,%.3f\n",
                 relative_time_sec,
                 btn1_cumulative_count_,
                 mode_,
@@ -339,7 +364,8 @@ private:
                 gx_, gy_, gz_,
                 mx_, my_, mz_,
                 bias_x_, bias_y_, bias_z_,
-                ekf_flags_);
+                ekf_flags_,
+                p0_raw_, p1_raw_, p2_raw_);
 
         // 50줄(0.5초)마다 디스크로 강제 플러시.
         // 매 줄 플러시하면 SD카드 I/O로 100Hz 루프가 밀리고, 아예 안 하면
@@ -388,7 +414,8 @@ private:
     uint16_t m1_, m2_, m3_, m4_;
     int32_t rpm_;
     float p0_cal_, p1_cal_, p2_cal_;
-    float t0_, t1_, t2_;   // 채널별 원시 온도(C) — 압력 드리프트 진단용
+    float t0_, t1_, t2_;      // 채널별 원시 온도(C) — 압력 드리프트 진단용
+    float p0_raw_, p1_raw_, p2_raw_;  // 채널별 원시 절대압(mbar, 영점 전). 고장/미수신 = NaN
     int32_t rssi_;
     float ax_, ay_, az_, gx_, gy_, gz_;      // 원시 6축 [g, 도/초]
     float mx_, my_, mz_;                     // 원시 지자기 [µT], 보정 전 칩 축

@@ -69,7 +69,7 @@ I2C sensors ──▶ i2c_driver_node ──▶ /raw/magnetometer ──▶ stat
 | `pid_control_node` | PID + motor mixing. Output `[0]=left servo, [1]=right servo, [2]=yaw servo, [3]=tail BLDC` |
 | `auto_scenario_node` | Time-based trajectory generator for AUTO mode |
 | `rpm_driver_node` | Hall-sensor pulse counting in a worker thread |
-| `data_logger_node` | 36-column CSV snapshot at 100 Hz — fused attitude **plus raw IMU/mag and EKF gyro bias + flags** (post-hoc diagnosis; raw mag enables offline recalibration). 200 MB per-file rotation, `Time(s)` continuous across files. |
+| `data_logger_node` | 39-column CSV snapshot at 100 Hz — fused attitude **plus raw IMU/mag/pressure and EKF gyro bias + flags** (post-hoc diagnosis; raw mag enables offline recalibration, raw pressure enables offline depth/pitot recomputation). 200 MB per-file rotation, `Time(s)` continuous across files. Schema: `log_csv/csv_format.md`. |
 
 ## Conventions you must know before editing
 
@@ -245,7 +245,7 @@ ls -l /proc/*/exe 2>/dev/null | grep '(deleted)'                                
 | Roll/pitch have no offset calibration | mounting baseline pitch ≈ 7.9° shows as a permanent nonzero attitude. §2.1 |
 | Post-assembly tests pending | tail-beat pitch bias, PID sign bench check **before water**, multi-attitude tilt accuracy. §8.2 |
 | Retired Mahony node dead members | six write-only members left from an old button implementation. §5.1 |
-| `data_logger_node` total log volume unbounded | ~80 MB/hour since raw columns (2026-08-18). Per-file 200 MB rotation exists, but old files are never deleted (deliberate — `log_csv/` also holds experiment CSVs and `mag_calib_params.txt`). Disk space is managed by hand. |
+| `data_logger_node` total log volume unbounded | ~84 MB/hour since raw pressure columns (2026-08-21; ~80 MB since 2026-08-18). Per-file 200 MB rotation exists, but old files are never deleted (deliberate — `log_csv/` also holds experiment CSVs and `mag_calib_params.txt`). Disk space is managed by hand. |
 
 ## Language
 
