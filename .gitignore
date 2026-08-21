@@ -5,9 +5,14 @@
 
 # Runtime data logs
 /log_csv/
+/log_csv_trash/
 
 # Editor / OS cruft
 *.swp
 *~
 .DS_Store
 .vscode/
+
+# 파이썬 바이트코드 (launch/scripts 실행 시 자동 생성)
+__pycache__/
+*.pyc

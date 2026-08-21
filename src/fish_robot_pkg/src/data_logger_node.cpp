@@ -10,14 +10,22 @@
 //          /rc/status                  (Int32MultiArray[5])  버튼/배터리/RSSI
 //          /motor/output               (UInt16MultiArray[4]) 최종 모터 출력
 //          /sensor/tail_rpm            (Int32)               꼬리 RPM
+//          /raw/imu_6dof               (Imu)                  원시 6축 — g, 도/초 그대로
+//          /raw/magnetometer           (Vector3)              원시 지자기[µT], 보정 전 칩 축
+//          /filtered/ekf_status        (Float32MultiArray[12]) [0..2] 자이로 바이어스, [10] 플래그
 //   [출력] ~/ros2_ws/log_csv/fish_log_YYYYMMDD_HHMMSS.csv
 //
 //  설계 : 콜백은 값을 멤버 변수에 "저장만" 하고, 10ms 타이머가 그 순간의
 //         최신 스냅샷을 한 줄로 기록한다. 토픽마다 주기가 달라도(압력 11Hz,
 //         자세 100Hz) 시간축이 일정한 표가 만들어진다.
 //
-//  ※ 파일이 무한히 커진다. 100Hz x 23컬럼이면 대략 시간당 40MB 수준이고,
-//     장시간 운용 로그가 GB 단위까지 자란 사례가 있다. 회전(rotation) 없음.
+//  원시값 3종을 상시 기록하는 이유(2026-08-18): 물속 운용은 재현이 안 된다.
+//  융합 결과만 남으면 자세 이상이 "센서 탓인지 필터 탓인지" 사후 규명이 불가능하다.
+//
+//  ※ 크기: 100Hz x 36컬럼 ≈ 시간당 80MB. 파일당 200MB(약 2.5시간)에서 새 파일로
+//     회전하며, Time(s) 축은 회전을 넘어 이어진다(기동 시각 기준 유지). 오래된
+//     파일은 지우지 않는다 — log_csv/에는 실험 CSV와 지자기 보정 파일이 같이
+//     살므로 자동 삭제는 위험하다. 총량 관리는 사람 몫.
 // =============================================================================
 
 #include <rclcpp/rclcpp.hpp>
@@ -27,6 +35,7 @@
 #include <std_msgs/msg/int32_multi_array.hpp>
 #include <std_msgs/msg/u_int16_multi_array.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +71,11 @@ public:
         p0_cal_ = 0.0f; p1_cal_ = 0.0f; p2_cal_ = 0.0f;
         t0_ = 0.0f; t1_ = 0.0f; t2_ = 0.0f;
         rssi_ = 0;
+        ax_ = 0.0f; ay_ = 0.0f; az_ = 0.0f;             // 원시 가속도 [g]
+        gx_ = 0.0f; gy_ = 0.0f; gz_ = 0.0f;             // 원시 자이로 [도/초]
+        mx_ = 0.0f; my_ = 0.0f; mz_ = 0.0f;             // 원시 지자기 [µT]
+        bias_x_ = 0.0f; bias_y_ = 0.0f; bias_z_ = 0.0f; // EKF 자이로 바이어스 추정 [도/초]
+        ekf_flags_ = 0;
 
         received_attitude_ = false;
         received_pressure_ = false;
@@ -88,6 +102,16 @@ public:
 
         rpm_sub_ = this->create_subscription<std_msgs::msg::Int32>(
             "/sensor/tail_rpm", 10, std::bind(&DataLoggerNode::rpm_callback, this, std::placeholders::_1));
+
+        // ---- 원시값 3종 (2026-08-18 추가) — 사후 진단용 상시 기록 ----
+        imu_raw_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            "/raw/imu_6dof", 10, std::bind(&DataLoggerNode::imu_raw_callback, this, std::placeholders::_1));
+
+        mag_raw_sub_ = this->create_subscription<geometry_msgs::msg::Vector3>(
+            "/raw/magnetometer", 10, std::bind(&DataLoggerNode::mag_raw_callback, this, std::placeholders::_1));
+
+        ekf_status_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+            "/filtered/ekf_status", 10, std::bind(&DataLoggerNode::ekf_status_callback, this, std::placeholders::_1));
 
         // 100Hz 기록 타이머 (모든 토픽의 최신 스냅샷을 한 줄로)
         logging_timer_ = this->create_wall_timer(
@@ -127,7 +151,18 @@ private:
         fp_ = fopen(file_path, "w");
         if (fp_ == nullptr) return -1;
 
-        fprintf(fp_, "Time(s),Btn1_Count,Mode,AutoMode,Roll,Pitch,Yaw,RC_T,RC_R,RC_P,RC_Y,M1,M2,M3,M4,RPM,P0_cal,P1_cal,P2_cal,T0,T1,T2,RSSI\n");
+        // 새 컬럼은 반드시 기존 23컬럼 "뒤에" 덧붙인다 — 열 번호로 읽는 기존
+        // 분석 스크립트(예전 C 펌웨어 규격 포함)가 깨지지 않게 하는 규칙이다.
+        // AX..AZ[g], GX..GZ[도/초] — nRF 원시 규약 그대로 (REP-103 아님)
+        // MX..MZ[µT] — 보정 전 칩 축. 원시로 남겨야 나중에 새 보정 계수를
+        //              오프라인으로 다시 적용할 수 있다 (보정 후 값은 역산 불가)
+        // BiasX..Z[도/초] — EKF 온라인 추정. EKF_Flags bit5(0x20)=지자기 두절(6축 폴백)
+        // ※ 축 주의: AX..GZ·MX..MZ는 "칩 축", BiasX..Z는 "FLU 몸체 축"이다.
+        //    원시 자이로에서 바이어스를 직접 빼면 틀린다 — 칩→몸체 변환
+        //    (bx,by,bz) = (-gz, -gx, +gy) 를 거친 뒤 빼야 한다 (실측 대조 완료:
+        //    BiasZ -3.06 이 원시 GY -3.0 에 대응).
+        fprintf(fp_, "Time(s),Btn1_Count,Mode,AutoMode,Roll,Pitch,Yaw,RC_T,RC_R,RC_P,RC_Y,M1,M2,M3,M4,RPM,P0_cal,P1_cal,P2_cal,T0,T1,T2,RSSI,"
+                     "AX,AY,AZ,GX,GY,GZ,MX,MY,MZ,BiasX,BiasY,BiasZ,EKF_Flags\n");
         fflush(fp_);   // 헤더는 즉시 기록해 파일이 비어 보이지 않게 한다
 
         return 0;
@@ -237,6 +272,34 @@ private:
         m4_ = msg->data[3];
     }
 
+    // 원시 6축. nRF가 보낸 g·도/초 단위 그대로다(REP-103 아님) — 변환 없이
+    // 기록해야 발행 당시 값과 1:1로 대조된다.
+    void imu_raw_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+        ax_ = static_cast<float>(msg->linear_acceleration.x);
+        ay_ = static_cast<float>(msg->linear_acceleration.y);
+        az_ = static_cast<float>(msg->linear_acceleration.z);
+        gx_ = static_cast<float>(msg->angular_velocity.x);
+        gy_ = static_cast<float>(msg->angular_velocity.y);
+        gz_ = static_cast<float>(msg->angular_velocity.z);
+    }
+
+    void mag_raw_callback(const geometry_msgs::msg::Vector3::SharedPtr msg) {
+        mx_ = static_cast<float>(msg->x);
+        my_ = static_cast<float>(msg->y);
+        mz_ = static_cast<float>(msg->z);
+    }
+
+    // EKF 진단(10Hz 발행이라 CSV에는 같은 값이 ~10행씩 반복된다 — 정상).
+    // 바이어스는 세션 간 50배씩 다르고 열로도 흐르므로(2시간에 0.06도/초 실측)
+    // 자세 이상 시 "바이어스 폭주였나"를 이 열이 즉답한다.
+    void ekf_status_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+        if (msg->data.size() < 12) return;
+        bias_x_ = msg->data[0];
+        bias_y_ = msg->data[1];
+        bias_z_ = msg->data[2];
+        ekf_flags_ = static_cast<int32_t>(msg->data[10]);
+    }
+
     void write_log_loop() {
         // 센서 연결 여부와 무관하게 노드 기동 즉시 로깅을 시작한다.
         // (이전에는 received_attitude_ && received_pressure_ 를 요구했는데, 압력센서를
@@ -257,7 +320,10 @@ private:
         double relative_time_sec = (this->now() - start_time_).seconds();
 
         // btn1_cumulative_count_ 를 기록합니다.
-        fprintf(fp_, "%.3f,%d,%d,%d,%.2f,%.2f,%.2f,%d,%d,%d,%d,%u,%u,%u,%u,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d\n",
+        // 자릿수: 가속도/바이어스 %.4f (바이어스 불안정성 실측이 0.001도/초 수준),
+        //         자이로 %.3f, 지자기 %.2f (노이즈 ~0.1µT 아래는 의미 없음)
+        fprintf(fp_, "%.3f,%d,%d,%d,%.2f,%.2f,%.2f,%d,%d,%d,%d,%u,%u,%u,%u,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,"
+                     "%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%d\n",
                 relative_time_sec,
                 btn1_cumulative_count_,
                 mode_,
@@ -268,7 +334,12 @@ private:
                 rpm_,
                 p0_cal_, p1_cal_, p2_cal_,
                 t0_, t1_, t2_,
-                rssi_);
+                rssi_,
+                ax_, ay_, az_,
+                gx_, gy_, gz_,
+                mx_, my_, mz_,
+                bias_x_, bias_y_, bias_z_,
+                ekf_flags_);
 
         // 50줄(0.5초)마다 디스크로 강제 플러시.
         // 매 줄 플러시하면 SD카드 I/O로 100Hz 루프가 밀리고, 아예 안 하면
@@ -277,6 +348,22 @@ private:
         if (++flush_cnt >= 50) {
             fflush(fp_);
             flush_cnt = 0;
+
+            // 파일당 200MB 회전. 판정은 플러시 직후에만 하므로 ftell이 곧 실제
+            // 파일 크기다. start_time_은 건드리지 않는다 — Time(s)가 파일 경계를
+            // 넘어 이어져야 회전된 파일들을 그대로 이어붙여 분석할 수 있다.
+            if (ftell(fp_) >= ROTATE_BYTES) {
+                fclose(fp_);
+                fp_ = nullptr;
+                if (init_log_file() < 0) {
+                    RCLCPP_ERROR(this->get_logger(),
+                                 "[Data Logger] 로그 회전 실패 — 기록 중단 (디스크 용량 확인 필요)");
+                    return;
+                }
+                RCLCPP_INFO(this->get_logger(),
+                            "[Data Logger] 200MB 도달 — 새 파일로 회전 (t = %.1f초, Time축 연속).",
+                            relative_time_sec);
+            }
         }
     }
 
@@ -303,6 +390,12 @@ private:
     float p0_cal_, p1_cal_, p2_cal_;
     float t0_, t1_, t2_;   // 채널별 원시 온도(C) — 압력 드리프트 진단용
     int32_t rssi_;
+    float ax_, ay_, az_, gx_, gy_, gz_;      // 원시 6축 [g, 도/초]
+    float mx_, my_, mz_;                     // 원시 지자기 [µT], 보정 전 칩 축
+    float bias_x_, bias_y_, bias_z_;         // EKF 자이로 바이어스 추정 [도/초]
+    int32_t ekf_flags_;                      // EKF 상태 비트 (bit5 = 6축 폴백)
+
+    static constexpr long ROTATE_BYTES = 200L * 1024 * 1024;   // 파일당 회전 문턱
 
     rclcpp::TimerBase::SharedPtr logging_timer_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr attitude_sub_;
@@ -312,6 +405,9 @@ private:
     rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr rc_status_sub_;
     rclcpp::Subscription<std_msgs::msg::UInt16MultiArray>::SharedPtr motor_sub_;
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr rpm_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_raw_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr mag_raw_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr ekf_status_sub_;
 };
 
 int main(int argc, char **argv) {
