@@ -5,7 +5,6 @@
 
 # Runtime data logs
 /log_csv/
-/log_csv_trash/
 
 # Editor / OS cruft
 *.swp
