@@ -131,6 +131,7 @@ enum { H_DEPTH = 0, H_SPEED, H_Q, H_QRAW, H_DPHYDRO, H_STATIC, H_PITCH, H_FLAGS,
 static constexpr uint32_t FLAG_DEPTH_OK   = 0x001;   // 수심 유효
 static constexpr uint32_t FLAG_SPEED_OK   = 0x002;   // 속도/q 유효
 // 정상값: 육상 대기 0x015 (수심+대기영점+자세), 물속 주행 0x01F (+속도+q영점)
+// 0x1000 이 켜지면 지연 보정이 꺼진 것과 같다 — 정상 동작에서는 절대 안 뜬다
 static constexpr uint32_t FLAG_ATM_ZERO   = 0x004;   // 대기압 영점 확보
 static constexpr uint32_t FLAG_Q_ZERO     = 0x008;   // 물속 q 영점 확보
 static constexpr uint32_t FLAG_ATT_FRESH  = 0x010;   // 자세 신선 (지연 보간 성공)
@@ -141,6 +142,7 @@ static constexpr uint32_t FLAG_RIGHT_DEAD = 0x100;   // 우 정압 포트 사망
 static constexpr uint32_t FLAG_Q_DEADBAND = 0x200;   // q 데드밴드 내 -> 속도 0 으로 보고
 static constexpr uint32_t FLAG_Q_NEGATIVE = 0x400;   // q<-3sigma 지속: 배정 뒤바뀜/기포/막힘 의심
 static constexpr uint32_t FLAG_PRESS_STOP = 0x800;   // 압력 스트림 정지
+static constexpr uint32_t FLAG_ATT_STALE  = 0x1000;  // 자세가 지연(72ms)보다 낡아 보간 못 함
 
 class HydroEstimatorNode : public rclcpp::Node {
 public:
@@ -611,16 +613,32 @@ private:
     }
 
     // 목표 시각의 자세를 선형 보간해 돌려준다. 버퍼가 비었거나 낡았으면 false.
-    bool attitude_at(const rclcpp::Time &target, double &roll, double &pitch) const {
+    //
+    // saturated: 목표를 버퍼 안에서 **감싸지 못해 끝값으로 포화**했다는 표시.
+    // 정상 동작에서는 절대 일어나지 않는다 — 버퍼가 0.64초를 덮는데 조회는 0.072초
+    // 전이고, 자세는 100Hz(10ms)로 온다. 그래서 포화 = 무언가 잘못됐다는 신호다:
+    //   · 뒤쪽 포화 = 자세가 지연보다 낡았다. 자세 스트림이 끊겼거나 느려졌다.
+    //     **또는 t_eff 의 부호를 잘못 써서 미래를 조회하고 있다** — 이 경우 항상
+    //     최신 자세가 돌아와 **보정을 안 한 것과 똑같아지는데** 겉보기엔 정상이다.
+    //     오차가 2배로 커지는 게 아니라 1배로 되돌아가는 것이라 훨씬 잡기 어렵다.
+    //   · 앞쪽 포화 = 버퍼가 아직 안 찼다. 기동 직후 수십 ms 동안만 정상이다.
+    bool attitude_at(const rclcpp::Time &target, double &roll, double &pitch,
+                     bool &saturated) const {
+        saturated = false;
         if (att_buf_.empty()) return false;
         if ((this->now() - last_att_time_).seconds() > att_timeout_ms_ * 1e-3) return false;
 
         // 목표가 버퍼보다 과거/미래면 끝값으로 포화시킨다 (외삽하지 않는다).
         if (target <= att_buf_.front().t) {
-            roll = att_buf_.front().roll; pitch = att_buf_.front().pitch; return true;
+            roll = att_buf_.front().roll; pitch = att_buf_.front().pitch;
+            // 버퍼가 지연을 덮을 만큼 찼는데도 앞에서 포화하면 비정상이다.
+            saturated = (att_buf_.size() >= 16);
+            return true;
         }
         if (target >= att_buf_.back().t) {
-            roll = att_buf_.back().roll; pitch = att_buf_.back().pitch; return true;
+            roll = att_buf_.back().roll; pitch = att_buf_.back().pitch;
+            saturated = true;
+            return true;
         }
         for (size_t i = 1; i < att_buf_.size(); i++) {
             const AttSample &a = att_buf_[i - 1], &b = att_buf_[i];
@@ -734,10 +752,19 @@ private:
             q_raw = (float)((double)p[ch_front_] - ssum / ns);
 
             // 자세를 **압력이 대표하는 과거 시각**에서 꺼낸다.
-            double roll_u, pitch_u;
+            double roll_u, pitch_u; bool att_sat = false;
             const rclcpp::Time t_eff = last_press_time_ - rclcpp::Duration::from_seconds(pressure_lag_ms_ * 1e-3);
-            if (attitude_at(t_eff, roll_u, pitch_u)) {
+            if (attitude_at(t_eff, roll_u, pitch_u, att_sat)) {
                 flags |= FLAG_ATT_FRESH;
+                if (att_sat) {
+                    flags |= FLAG_ATT_STALE;
+                    // 이 경고가 뜨면 지연 보정이 사실상 꺼진 상태다. 자세 스트림을
+                    // 먼저 의심하고, 그게 멀쩡하면 t_eff 의 부호를 확인할 것.
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                        "[Hydro] 자세 링버퍼에서 %.0f ms 전 값을 감싸지 못해 끝값으로 포화했습니다 — "
+                        "지연 보정이 사실상 꺼진 상태입니다. 자세 스트림(100Hz)을 확인하십시오.",
+                        pressure_lag_ms_);
+                }
             } else {
                 // 자세가 없으면 장착 기준 피치로 폴백한다. 기동 직후 수 초간
                 // /filtered/attitude_ekf 가 아예 없는 것은 **정상**이므로 ERROR 를 찍지 않는다.
