@@ -323,8 +323,9 @@ private:
         RCLCPP_INFO(this->get_logger(), "[Hydro] 출력: /filtered/hydro [depth, speed, q, q_raw, dP_hydro, static, pitch, flags]");
         RCLCPP_INFO(this->get_logger(), "[Hydro]       /sensor/pressure_calibrated (EKF에서 이관 — 발행자는 반드시 1개)");
         RCLCPP_INFO(this->get_logger(), "[Hydro] 재영점: btn1 롱프레스 3초, 또는 서비스 /hydro/zero_atm");
-        RCLCPP_INFO(this->get_logger(), "[Hydro] 물속 q 영점: 서비스 /hydro/zero_q  (%s)",
-                    q_zero_captured_ ? "확보됨" : "**미확보 — 속도는 상대값**");
+        RCLCPP_INFO(this->get_logger(), "[Hydro] q 영점: %s  (물속 재포착: /hydro/zero_q)",
+                    !q_zero_captured_ ? "**미확보** — 대기압 영점 포착 때 공기 Δb 로 자동으로 채웁니다"
+                                      : (q_zero_from_air_ ? "공기 Δb (물속에서 다시 잡으면 더 정확)" : "물속 실측"));
         RCLCPP_INFO(this->get_logger(),
                     "[Hydro]   기하: lever=(%.3f, %.3f, %.3f) m, k=%.3f, 지연 %.0f ms",
                     lever_x_, lever_y_, lever_z_, speed_k_, pressure_lag_ms_);
@@ -401,14 +402,14 @@ private:
         if (!f.is_open()) return false;
         std::string line;
         double epoch = 0.0; float o[3] = {NAN, NAN, NAN};
-        double q_off = 0.0; int q_ok = 0;
+        double q_off = 0.0; int q_ok = 0, q_air = 0;
         bool got = false;
         while (std::getline(f, line)) {
             if (line.empty() || line[0] == '#') continue;
             std::istringstream ss(line);
             if (ss >> epoch >> o[0] >> o[1] >> o[2]) {
                 got = true;
-                ss >> q_off >> q_ok;   // 옛 형식(4칸)이면 여기서 실패해도 q_ok=0 으로 남는다
+                ss >> q_off >> q_ok >> q_air;   // 옛 형식이면 못 읽은 칸은 0 으로 남는다
                 break;
             }
         }
@@ -438,10 +439,11 @@ private:
 
         // ── q 영점: 확정 적재. 재포착에 물속 정지가 필요해 자동으로 못 잡는다 ──
         if (q_ok && age <= q_zero_max_age_) {
-            q_offset_ = q_off; q_zero_captured_ = true;
+            q_offset_ = q_off; q_zero_captured_ = true; q_zero_from_air_ = (q_air != 0);
             RCLCPP_INFO(this->get_logger(),
-                "[Hydro] q 영점 적재 (%.0f시간 전): %.4f mbar — 차압은 날씨가 상쇄되어 "
-                "하루를 가도 0.053 mbar 이내다(3.87일 실측).", age / 3600.0, q_off);
+                "[Hydro] q 영점 적재 (%.0f시간 전, %s): %.4f mbar — 차압은 날씨가 상쇄되어 "
+                "하루를 가도 0.053 mbar 이내다(3.87일 실측).",
+                age / 3600.0, q_zero_from_air_ ? "공기 Δb" : "물속", q_off);
         } else if (q_ok) {
             RCLCPP_WARN(this->get_logger(),
                 "[Hydro] q 영점이 %.0f시간 지나 버립니다 (한계 %.0f시간) -> 속도는 상대값입니다.",
@@ -459,10 +461,10 @@ private:
             return;
         }
         fprintf(fp, "# hydro_estimator_node 영점 (자동 생성 — 손으로 고치지 말 것)\n");
-        fprintf(fp, "# epoch_sec  ch0_mbar  ch1_mbar  ch2_mbar  q_offset_mbar  q_valid\n");
-        fprintf(fp, "%.3f %.4f %.4f %.4f %.4f %d\n", this->now().seconds(),
+        fprintf(fp, "# epoch_sec  ch0_mbar  ch1_mbar  ch2_mbar  q_offset_mbar  q_valid  q_from_air\n");
+        fprintf(fp, "%.3f %.4f %.4f %.4f %.4f %d %d\n", this->now().seconds(),
                 atm_offset_[0], atm_offset_[1], atm_offset_[2],
-                q_offset_, q_zero_captured_ ? 1 : 0);
+                q_offset_, q_zero_captured_ ? 1 : 0, q_zero_from_air_ ? 1 : 0);
         fclose(fp);
         if (rename(tmp.c_str(), zero_path_.c_str()) != 0)
             RCLCPP_WARN(this->get_logger(), "[Hydro] 영점 파일 교체 실패 (%s)", zero_path_.c_str());
@@ -505,6 +507,11 @@ private:
         }
 
         for (int i = 0; i < 3; i++) if (alive[i]) acc_[i].push_back(p[i]);
+        // 차압도 같은 샘플에서 함께 모은다. 채널별 중앙값의 차가 아니라 **차의 중앙값**을
+        // 써야 짝이 맞는다 — 채널마다 유효 샘플 수가 다를 수 있기 때문이다.
+        if (alive[ch_front_] && alive[ch_left_] && alive[ch_right_])
+            q_air_acc_.push_back((float)((double)p[ch_front_]
+                                 - ((double)p[ch_left_] + (double)p[ch_right_]) / 2.0));
         collect_msgs_++;
         if (collect_msgs_ < atm_window_) return;
 
@@ -544,6 +551,12 @@ private:
             report += buf;
         }
 
+        // **reset_collection() 이 q_air_acc_ 를 비우므로 그 전에 통계를 뽑아둔다.**
+        const bool  q_air_ok     = ((int)q_air_acc_.size() >= atm_window_ / 2);
+        const size_t q_air_n     = q_air_acc_.size();
+        Stat        q_air_stat   = {0.0f, 0.0f, 0.0f};
+        if (q_air_ok) q_air_stat = stat_of(q_air_acc_);
+
         reset_collection();
 
         if (ok_count == 0) {
@@ -578,11 +591,51 @@ private:
         RCLCPP_INFO(this->get_logger(), "[Hydro] ※ EKF의 P*_cal 영점과 수백분의 1 mbar 다른 것은 정상입니다 —");
         RCLCPP_INFO(this->get_logger(), "[Hydro]   서로 다른 시각에 독립적으로 잡은 값이라 그렇습니다.");
         RCLCPP_INFO(this->get_logger(), "=========================================");
+
+        // ── 같은 데이터에서 q 영점(Δb)도 뽑는다 ──────────────────────────────
+        // 공기 중 차압이 곧 센서 개체차 Δb 다. 공기는 물보다 828배 가벼워 기울기 효과가
+        // 20도에서도 0.007 mbar(잡음의 1/27)라 사실상 0이기 때문이다.
+        // 이게 없으면 **정지 상태에서 0.39 m/s 를 읽는다**(Δb 실측 0.775 mbar).
+        //
+        // **물속 영점이 이미 있으면 덮어쓰지 않는다.** 물속 값은 기하 모델 오차까지
+        // 그 자세에서 흡수하므로 더 좋다. 역할이 다르다:
+        //   · 공기 Δb  : 센서 개체차만. 남는 오차 = dP_hydro 모델 오차
+        //   · 물속 영점 : 모델 오차까지 흡수. 단 잡은 그 자세에서만
+        // lever_x/z 가 기울기 시험으로 정확해지면 둘이 거의 같아진다.
+        if (q_air_ok) {
+            const Stat &qs = q_air_stat;
+            const float qspread = qs.p95 - qs.p05;
+            if (q_zero_captured_ && !q_zero_from_air_) {
+                RCLCPP_INFO(this->get_logger(),
+                    "[Hydro] 공기 Δb = %.4f mbar (참고). 물속 q 영점 %.4f 가 이미 있어 유지합니다.",
+                    qs.med, q_offset_);
+            } else if (std::abs((double)qs.med) > q_offset_max_) {
+                RCLCPP_WARN(this->get_logger(),
+                    "[Hydro] 공기 Δb 가 %.4f mbar 로 너무 큽니다 (한계 %.1f) — q 영점을 채우지 않습니다. "
+                    "포트 배정이나 배선을 확인하십시오.", qs.med, q_offset_max_);
+            } else {
+                q_offset_        = qs.med;
+                q_zero_captured_ = true;
+                q_zero_from_air_ = true;
+                q_lpf_seeded_    = false;
+                RCLCPP_INFO(this->get_logger(),
+                    "[Hydro] q 영점을 공기 Δb 로 채웠습니다: %.4f mbar (산포 %.4f, %zu샘플).",
+                    q_offset_, qspread, q_air_n);
+                RCLCPP_INFO(this->get_logger(),
+                    "[Hydro]   이걸로 속도가 바로 나옵니다. 남는 오차는 dP_hydro 모델 오차뿐이고, "
+                    "물속 정지 상태에서 Speed 를 읽어보면 그 크기가 그대로 보입니다.");
+            }
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                "[Hydro] 세 채널이 동시에 살아있는 샘플이 부족해 q 영점을 못 채웠습니다 (%zu개). "
+                "속도는 물속 q 영점을 잡기 전까지 안 나옵니다.", q_air_n);
+        }
         save_zero_file();
     }
 
     void reset_collection() {
         for (int i = 0; i < 3; i++) { acc_[i].clear(); acc_[i].reserve(atm_window_); }
+        q_air_acc_.clear();
         collect_msgs_ = 0;
     }
 
@@ -999,6 +1052,7 @@ private:
 
         q_offset_        = med;
         q_zero_captured_ = true;
+        q_zero_from_air_ = false;   // 물속에서 잡았다 — 공기 Δb 가 덮어쓰지 못하게
         q_lpf_seeded_    = false;   // 영점이 바뀌었으니 필터를 다시 시드한다
         RCLCPP_WARN(this->get_logger(), "=========================================");
         RCLCPP_WARN(this->get_logger(),
@@ -1069,6 +1123,8 @@ private:
     bool          q_zero_captured_   = false;
     bool          q_zero_collecting_ = false;
     std::vector<double> q_acc_;
+    std::vector<float>  q_air_acc_;   // 대기압 수집 중 함께 모으는 차압 (acc_ 와 형 일치)
+    bool          q_zero_from_air_ = false;
     double        q_lpf_             = 0.0;
     bool          q_lpf_seeded_      = false;
     int           q_neg_run_         = 0;
