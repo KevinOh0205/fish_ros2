@@ -243,10 +243,20 @@ private:
         atm_min_mbar_   = this->declare_parameter<double>("atm_valid_min_mbar", 900.0);
         atm_max_mbar_   = this->declare_parameter<double>("atm_valid_max_mbar", 1100.0);
 
-        // 저장 영점의 유효 기간. **길게 잡으면 안 된다** — 기압은 전선이 지나갈 때
-        // 시간당 1~2 hPa 움직이고 그건 수심 1~2 cm다. 이 저장의 목적은 respawn
-        // 생존(수 초)이지 세션 간 재사용이 아니다.
-        zero_max_age_   = this->declare_parameter<double>("zero_max_age_sec", 600.0);
+        // 두 영점의 유효기간은 **다르다**. 같은 파일에 저장하지만 성질이 반대다.
+        //
+        // 대기압 영점은 절대압이라 날씨를 그대로 맞는다. 3.87일 벤치 실측:
+        //   1시간 최악 1.50 / 8시간 최악 3.42 / 하루 최악 3.02 mbar (= 수심 3.5 cm)
+        // 그래서 오래된 값을 그대로 쓰면 안 된다. 다만 **버리는 대신 잠정값으로 쓰고
+        // 웜업 뒤 다시 잡아 교체한다** — 그러면 기동 직후 수심이 NaN 인 구간이 없어지고
+        // 정확도도 잃지 않는다. 유효기간은 "잠정값으로 쓸 만한가"의 의미다.
+        atm_zero_max_age_ = this->declare_parameter<double>("atm_zero_max_age_sec", 86400.0);
+        //
+        // q 영점은 **차압**이라 날씨가 세 채널에 똑같이 걸려 지워진다. 같은 3.87일
+        // 기록에서 차압의 블록평균 표준편차가 10분~6시간 내내 0.053 mbar 로 **평평했다**
+        // (다시 커지지 않았다 = random walk 없음). 즉 하루를 가도 0.053 mbar 이내이고
+        // 그건 1.0 m/s 에서 0.53 % 다. 그리고 재포착에 물속 정지가 필요해 자동으로 못 한다.
+        q_zero_max_age_   = this->declare_parameter<double>("q_zero_max_age_sec", 86400.0);
 
         press_timeout_  = this->declare_parameter<double>("pressure_timeout_sec", 0.5);
 
@@ -304,9 +314,12 @@ private:
         RCLCPP_INFO(this->get_logger(), "[Hydro]   대기압 영점: 웜업 %.0f초, 창 %d샘플(중앙값), 산포한계 %.2f mbar, 타당범위 [%.0f, %.0f]",
                     warmup_sec_, atm_window_, atm_spread_max_, atm_min_mbar_, atm_max_mbar_);
         if (atm_captured_) {
-            RCLCPP_INFO(this->get_logger(), "[Hydro]   저장 영점 적재됨: %.3f / %.3f / %.3f mbar",
-                        atm_offset_[0], atm_offset_[1], atm_offset_[2]);
+            RCLCPP_INFO(this->get_logger(), "[Hydro]   대기압 영점: %.3f / %.3f / %.3f mbar%s",
+                        atm_offset_[0], atm_offset_[1], atm_offset_[2],
+                        atm_provisional_ ? "  (**잠정** — 웜업 뒤 교체 예정)" : "");
         }
+        RCLCPP_INFO(this->get_logger(), "[Hydro]   영점 유효기간: 대기압 %.0f시간(잠정 적재용), q %.0f시간",
+                    atm_zero_max_age_ / 3600.0, q_zero_max_age_ / 3600.0);
         RCLCPP_INFO(this->get_logger(), "[Hydro] 출력: /filtered/hydro [depth, speed, q, q_raw, dP_hydro, static, pitch, flags]");
         RCLCPP_INFO(this->get_logger(), "[Hydro]       /sensor/pressure_calibrated (EKF에서 이관 — 발행자는 반드시 1개)");
         RCLCPP_INFO(this->get_logger(), "[Hydro] 재영점: btn1 롱프레스 3초, 또는 서비스 /hydro/zero_atm");
@@ -401,21 +414,38 @@ private:
         if (!got) return false;
 
         const double age = this->now().seconds() - epoch;
-        if (age < 0.0 || age > zero_max_age_) {
-            RCLCPP_WARN(this->get_logger(),
-                        "[Hydro] 저장된 영점이 %.0f초 지났습니다 (한계 %.0f초) -> 버리고 새로 잡습니다. "
-                        "기압은 시간당 1~2 hPa(수심 1~2 cm) 움직입니다.", age, zero_max_age_);
+        if (age < 0.0) {
+            RCLCPP_WARN(this->get_logger(), "[Hydro] 저장된 영점의 시각이 미래입니다 (%.0f초) -> 무시합니다.", age);
             return false;
         }
-        for (int i = 0; i < 3; i++) atm_offset_[i] = o[i];
-        atm_captured_ = true;
-        if (q_ok) {
-            q_offset_ = q_off; q_zero_captured_ = true;
-            RCLCPP_INFO(this->get_logger(), "[Hydro] 저장된 q 영점도 함께 적재: %.4f mbar", q_off);
+
+        // ── 대기압: 잠정 적재. 웜업 뒤 다시 잡아 교체한다 ──
+        if (age <= atm_zero_max_age_) {
+            for (int i = 0; i < 3; i++) atm_offset_[i] = o[i];
+            atm_captured_    = true;
+            atm_provisional_ = true;     // 아직 이번 세션에서 잡은 값이 아니다
+            RCLCPP_WARN(this->get_logger(),
+                "[Hydro] 대기압 영점을 **잠정값으로** 적재 (%.0f시간 전): %.3f / %.3f / %.3f mbar. "
+                "웜업 뒤 다시 잡아 교체합니다 — 그때까지 수심에 최대 수 cm 오차가 있을 수 있습니다.",
+                age / 3600.0, o[0], o[1], o[2]);
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                "[Hydro] 대기압 영점이 %.0f시간 지나 잠정값으로도 쓸 수 없습니다 (한계 %.0f시간).",
+                age / 3600.0, atm_zero_max_age_ / 3600.0);
         }
-        RCLCPP_INFO(this->get_logger(), "[Hydro] 저장된 영점 적재 (%.0f초 전): %.3f / %.3f / %.3f mbar",
-                    age, o[0], o[1], o[2]);
-        return true;
+
+        // ── q 영점: 확정 적재. 재포착에 물속 정지가 필요해 자동으로 못 잡는다 ──
+        if (q_ok && age <= q_zero_max_age_) {
+            q_offset_ = q_off; q_zero_captured_ = true;
+            RCLCPP_INFO(this->get_logger(),
+                "[Hydro] q 영점 적재 (%.0f시간 전): %.4f mbar — 차압은 날씨가 상쇄되어 "
+                "하루를 가도 0.053 mbar 이내다(3.87일 실측).", age / 3600.0, q_off);
+        } else if (q_ok) {
+            RCLCPP_WARN(this->get_logger(),
+                "[Hydro] q 영점이 %.0f시간 지나 버립니다 (한계 %.0f시간) -> 속도는 상대값입니다.",
+                age / 3600.0, q_zero_max_age_ / 3600.0);
+        }
+        return atm_captured_;
     }
 
     void save_zero_file() {
@@ -515,18 +545,38 @@ private:
         reset_collection();
 
         if (ok_count == 0) {
-            RCLCPP_ERROR(this->get_logger(), "[Hydro] 대기압 영점 포착 실패 — 다시 시도합니다\n%s", report.c_str());
+            // 잠정값을 들고 있으면 실패해도 치명적이지 않다 — 물속 respawn 이 정확히
+            // 이 경우다(게이트가 물속 포착을 막아준다). 그래서 잠정값이 있을 때는
+            // 몇 번만 시도하고 조용해진다. 없으면 성공할 때까지 계속 시도한다.
+            if (atm_provisional_) {
+                if (++atm_retry_ <= 3) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "[Hydro] 대기압 재포착 실패 (%d/3) — 잠정값을 유지합니다. 물속이면 정상입니다.\n%s",
+                        atm_retry_, report.c_str());
+                } else if (atm_retry_ == 4) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "[Hydro] 대기압 재포착을 포기하고 잠정값으로 계속 갑니다. "
+                        "공기 중으로 꺼낸 뒤 btn1 롱프레스로 다시 잡으십시오.");
+                }
+                if (atm_retry_ > 3) atm_provisional_ = false;   // 더 시도하지 않는다
+            } else {
+                RCLCPP_ERROR(this->get_logger(), "[Hydro] 대기압 영점 포착 실패 — 다시 시도합니다\n%s", report.c_str());
+            }
             return;
         }
 
+        const bool was_provisional = atm_provisional_;
         atm_captured_    = true;
+        atm_provisional_ = false;
+        atm_retry_       = 0;
         force_recapture_ = false;
         RCLCPP_INFO(this->get_logger(), "=========================================");
-        RCLCPP_INFO(this->get_logger(), "[Hydro] 대기압 영점 포착 완료 (%d채널)\n%s", ok_count, report.c_str());
+        RCLCPP_INFO(this->get_logger(), "[Hydro] 대기압 영점 포착 완료 (%d채널)%s\n%s",
+                    ok_count, was_provisional ? " — 잠정값을 교체했습니다" : "", report.c_str());
         RCLCPP_INFO(this->get_logger(), "[Hydro] ※ EKF의 P*_cal 영점과 수백분의 1 mbar 다른 것은 정상입니다 —");
         RCLCPP_INFO(this->get_logger(), "[Hydro]   서로 다른 시각에 독립적으로 잡은 값이라 그렇습니다.");
         RCLCPP_INFO(this->get_logger(), "=========================================");
-        if (this->get_parameter("zero_max_age_sec").as_double() > 0.0) save_zero_file();
+        save_zero_file();
     }
 
     void reset_collection() {
@@ -613,7 +663,8 @@ private:
         bool alive[3];
         for (int i = 0; i < 3; i++) alive[i] = std::isfinite(p[i]) && p[i] >= 100.0f;
 
-        if (!atm_captured_ || force_recapture_) collect_atm(p, alive);
+        // 잠정 적재 상태에서도 재포착을 시도한다. 성공하면 교체하고 잠정 표시를 뗀다.
+        if (!atm_captured_ || atm_provisional_ || force_recapture_) collect_atm(p, alive);
 
         publish(p, alive);
     }
@@ -901,7 +952,7 @@ private:
     double q_lpf_tau_, q_sigma_, q_deadband_n_, q_offset_max_, q_spread_max_, min_submerged_;
     int    q_window_;
     double warmup_sec_, atm_spread_max_, atm_min_mbar_, atm_max_mbar_;
-    double zero_max_age_, press_timeout_;
+    double atm_zero_max_age_, q_zero_max_age_, press_timeout_;
     int    atm_window_;
     std::string port_map_path_, zero_path_, port_map_note_;
 
@@ -911,6 +962,8 @@ private:
     // ---- 영점 상태 ----
     float  atm_offset_[3];
     bool   atm_captured_    = false;
+    bool   atm_provisional_ = false;   // 파일에서 적재만 했고 이번 세션에서 안 잡은 상태
+    int    atm_retry_       = 0;
     bool   force_recapture_ = false;
     std::vector<float> acc_[3];
     int    collect_msgs_    = 0;
