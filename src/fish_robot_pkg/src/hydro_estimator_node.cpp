@@ -695,6 +695,10 @@ private:
         if (!alive[ch_left_])  flags |= FLAG_LEFT_DEAD;
         if (!alive[ch_right_]) flags |= FLAG_RIGHT_DEAD;
         if (atm_captured_)     flags |= FLAG_ATM_ZERO;
+        // **상태 플래그는 게이팅하지 않는다.** q 영점의 유무는 포트 생존과 무관한
+        // 사실인데, 속도 블록 안에 두면 포트가 죽었을 때 "영점이 없어서 속도가 없나"로
+        // 오독된다. CSV 만 보고 원인을 짚으려면 각 플래그가 독립적이어야 한다.
+        if (q_zero_captured_) flags |= FLAG_Q_ZERO;
         if (press_stopped_)    flags |= FLAG_PRESS_STOP;
 
         // 정압 포트의 게이지압 평균. 채널마다 자기 영점을 빼므로, 한쪽이 죽어도
@@ -785,8 +789,6 @@ private:
                     "[Hydro] 자세가 없어 속도를 내지 않습니다(NaN). 원시 차압 Q_raw 는 계속 기록되므로 "
                     "나중에 오프라인 재계산이 가능합니다.");
             }
-
-            if (q_zero_captured_) flags |= FLAG_Q_ZERO;
 
             if (have_att && q_zero_captured_) {
                 const double q_corr = (double)q_raw - (double)dph - q_offset_;
