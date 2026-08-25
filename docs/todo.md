@@ -50,7 +50,7 @@
 - [x] ~~**`half_span_` 파라미터가 어디에도 안 쓰인다**~~ — **완료 2026-08-25**
       위 결정으로 쓸 데가 없어져 **파라미터를 제거**했다. 배선하는 대신 지웠다 —
       안 쓰이는 파라미터가 기동 로그에 찍히면 거짓 안심을 준다. 좌우 8.8 cm 라는 수치는
-      `port_map.txt` 안내문과 문서에만 남는다.
+      `config/port_map.txt` 안내문과 문서에만 남는다.
 
 - [x] ~~**q 영점이 10분 만에 버려진다**~~ — **완료 2026-08-25**
       유효기간을 분리했다: 대기압 `atm_zero_max_age_sec` 24시간(잠정 적재용), q `q_zero_max_age_sec` 24시간.
@@ -141,8 +141,11 @@
       ls -lt fish_log_*.csv          # 최근 것부터 확인
       rm fish_log_2026082*.csv       # **접두사 fish_log_ 만** 지운다
       ```
-      **남겨야 하는 것**: `mag_calib_params.txt`(EKF가 실제로 읽는 활성 파일),
-      `hydro_zero.txt`, `port_map.txt`, 그리고 실험 CSV(`allan_`, `presschar_`,
+      **보정·설정 3종은 2026-08-25에 `config/` 로 옮겼다** — `mag_calib_params.txt`,
+      `port_map.txt`, `hydro_zero.txt`. 앞의 둘은 git 으로 추적하므로 실수로 지워도
+      `git checkout -- config/` 로 되살아난다. 이 이사의 계기는 지자기 보정 파일이
+      실제로 로그 정리에 휩쓸려 사라진 사고다(§10.1).
+      **`log_csv/` 에서 남겨야 하는 것**: 실험 CSV(`allan_`, `presschar_`,
       `spin360_`, `tumble_`, `bench_`) — 이들은 문서화된 측정의 유일한 원본이다.
 
       ※ 지우기 전에 활동이 있었는지 30초면 확인된다:
@@ -168,7 +171,7 @@
       보정 파일을 섞어 두는 구조라 로그 정리 때 함께 날아간 것으로 보인다. §10.1
 
 - [ ] **포트 신원 확인** — 노즈 구멍에 입으로 바람을 불어 `data[0]`만 오르는지
-      확인되면 `log_csv/port_map.txt`의 `verified: no` → `yes`
+      확인되면 `config/port_map.txt`의 `verified: no` → `yes`
       *(밀봉 전에 하는 게 물속 롤 시험보다 확실하다)*
 
 - [ ] **PID 부호 벤치 확인** ← **물 전 필수, 유일하게 "필수"로 명시된 항목**

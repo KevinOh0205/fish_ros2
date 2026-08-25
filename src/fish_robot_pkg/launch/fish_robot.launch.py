@@ -107,7 +107,7 @@ def generate_launch_description():
         #    ※ 수심은 좌우 정압 포트의 산술평균이라 **자세와 무관하게 정확**하다
         #      (압력이 깊이에 선형이므로 두 점의 평균 = 기하학적 중점의 압력).
         #      그래서 IMU가 빠져 있어도, 지자기 보정이 없어도 수심은 나온다.
-        #    ※ 포트 역할(front/left/right)은 여기가 아니라 log_csv/port_map.txt 에서
+        #    ※ 포트 역할(front/left/right)은 여기가 아니라 config/port_map.txt 에서
         #      읽는다. 센서 지문(PROM) 대조와 한 곳에 묶어두기 위해서다.
         Node(
             package='fish_robot_pkg',

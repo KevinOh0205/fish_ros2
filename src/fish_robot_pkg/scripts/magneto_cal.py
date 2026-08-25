@@ -37,7 +37,7 @@ IMU_TO_FLU = lambda x, y, z: (-z, -x, y)          # noqa: E731
 # 지자기: 칩 축 -> FLU. 2026-08-06 텀블로 확인 (복각 144.5도 vs 한국 143도).
 MAG_TO_FLU = lambda x, y, z: (y, x, -z)           # noqa: E731
 
-DEFAULT_OUT = os.path.expanduser("~/ros2_ws/log_csv/mag_calib_params.txt")
+DEFAULT_OUT = os.path.expanduser("~/ros2_ws/config/mag_calib_params.txt")
 DEFAULT_LOGDIR = os.path.expanduser("~/ros2_ws/log_csv")
 
 NBIN = 8            # 자세마다 제자리 회전을 8구간(45도)으로 나눈다

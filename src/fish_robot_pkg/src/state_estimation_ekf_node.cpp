@@ -359,8 +359,8 @@ private:
         mag_scale_x_ = 0.858f; mag_scale_y_ = 0.938f; mag_scale_z_ = 1.301f;
 
         const char *home_dir = getenv("HOME");
-        std::string file_path = home_dir ? (std::string(home_dir) + "/ros2_ws/log_csv/mag_calib_params.txt")
-                                         : "./log_csv/mag_calib_params.txt";
+        std::string file_path = home_dir ? (std::string(home_dir) + "/ros2_ws/config/mag_calib_params.txt")
+                                         : "./config/mag_calib_params.txt";
         std::ifstream infile(file_path);
         if (infile.is_open()) {
             infile >> mag_bias_x_ >> mag_bias_y_ >> mag_bias_z_

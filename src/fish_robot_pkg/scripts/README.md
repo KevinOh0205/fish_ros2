@@ -38,7 +38,7 @@ ros2 run fish_robot_pkg magneto_cal.py
 ```
 
 여섯 자세가 다 차면 자동으로 끝나고, 품질 검사를 통과하면
-`~/ros2_ws/log_csv/mag_calib_params.txt` 에 저장한다(기존 파일은 `.bak_날짜` 로 백업).
+`~/ros2_ws/config/mag_calib_params.txt` 에 저장한다(기존 파일은 `.bak_날짜` 로 백업).
 
 | 옵션 | 용도 |
 |---|---|

@@ -15,7 +15,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Vector3
 
-CAL = "/home/fish/ros2_ws/log_csv/mag_calib_params.txt"
+CAL = "/home/fish/ros2_ws/config/mag_calib_params.txt"
 BIAS_SEC = 6.0
 
 

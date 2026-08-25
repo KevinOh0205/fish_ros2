@@ -8,6 +8,13 @@ log/
 # Runtime data logs
 /log_csv/
 
+# 보정·설정은 config/ 에 둔다 — log_csv/ 는 지워도 되는 곳이라 정리 한 번에
+# 같이 날아간다(2026-08-25 에 실제로 지자기 보정 파일을 그렇게 잃었다).
+# mag_calib_params.txt 와 port_map.txt 는 **일부러 추적한다** — 지워져도
+# git checkout 으로 되살릴 수 있는 것이 이 이사의 핵심이다.
+# hydro_zero.txt 만 뺀다: 영점을 잡을 때마다 바뀌어 커밋 잡음이 된다.
+/config/hydro_zero.txt
+
 # Editor / OS cruft
 *.swp
 *~

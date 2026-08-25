@@ -209,11 +209,9 @@ clamp events, because its fixed `Kp·dt` correction step must stay bounded. §1.
   best yet; hard iron (−7.5, +20.5, −83.8) µT, back to chip-Z dominance like the 08-06 strip state.
   Supersedes 2026-08-17 assembled (6.1 %, 137.2°, (+9.9, +61.6, −16.1)) (§9, §10.2). Tumble in one spot,
   ≥1 m from steel; **never calibrate from a flat spin** (it cannot see the vertical offset). File:
-  `~/ros2_ws/log_csv/mag_calib_params.txt`. **That file went missing before 2026-08-25** and the EKF
-  ran on source-code defaults (dip 11.1° — physically impossible, and it said so in an ERROR every
-  boot). `log_csv/` mixes disposable logs with three files that must never be deleted —
-  `mag_calib_params.txt`, `port_map.txt`, `hydro_zero.txt` — and **all three fail silently**, one WARN
-  then defaults. Check them before any log cleanup (§10.1). (A stale `mag_calib.txt` sat at the workspace root,
+  **`~/ros2_ws/config/mag_calib_params.txt`** — moved out of `log_csv/` on 2026-08-25 after that file
+  went missing in a log cleanup and the EKF spent an unknown period on source-code defaults (dip 11.1°,
+  physically impossible; it printed an ERROR every boot and nobody read it). See `config/README.md`. (A stale `mag_calib.txt` sat at the workspace root,
   read by nothing — deleted 2026-08-25. It held June-9 **min/max** values, the method retired for
   measuring *worse than no calibration*, so it looked restorable but would have made things worse.)
 - **A bad mag vector corrupted Mahony's roll/pitch** (5.0°/1.7° measured), not just yaw; the EKF's
@@ -279,7 +277,7 @@ It carries the water-vs-bench split, the "must be done before water" items, and 
 | Roll/pitch have no offset calibration | **Roll** shows a stable +6.4° over a 3.87-day bench record — that looks like a genuine mounting offset. **Pitch does not**: the "≈ 7.9°" from 2026-08-04 (§2.1) did not reproduce — the same 3.87 days averaged **−0.45°** (range −1.03 … +0.38) and another day read +5.83°. Resting pitch depends on how the robot is set down, so **do not treat 7.9° as a constant**. `hydro_estimator_node` used it as an attitude fallback until 2026-08-25; that fallback is gone (speed is NaN without attitude). |
 | Post-assembly tests pending | tail-beat pitch bias, PID sign bench check **before water**, multi-attitude tilt accuracy. §8.2 |
 | Retired Mahony node dead members | six write-only members left from an old button implementation. §5.1 |
-| `data_logger_node` total log volume unbounded | ~84 MB/hour since raw pressure columns (2026-08-21; ~80 MB since 2026-08-18). Per-file 200 MB rotation exists, but old files are never deleted (deliberate — `log_csv/` also holds experiment CSVs and `mag_calib_params.txt`). Disk space is managed by hand. |
+| `data_logger_node` total log volume unbounded | ~84 MB/hour since raw pressure columns (2026-08-21; ~80 MB since 2026-08-18). Per-file 200 MB rotation exists, but old files are never deleted (deliberate — `log_csv/` also holds the experiment CSVs; the calibration files now live in `config/`). Disk space is managed by hand. |
 
 ## Language
 

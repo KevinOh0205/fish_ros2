@@ -196,8 +196,8 @@ private:
     //   런타임 감시(주행 중 q_raw 지속 음수 -> 배정 뒤바뀜 의심)가 맡는다.
     void verify_port_map() {
         const char *home = getenv("HOME");
-        const std::string path = home ? (std::string(home) + "/ros2_ws/log_csv/port_map.txt")
-                                      : "./log_csv/port_map.txt";
+        const std::string path = home ? (std::string(home) + "/ros2_ws/config/port_map.txt")
+                                      : "./config/port_map.txt";
         static const char *ROLE[3] = {"front", "left", "right"};   // 기본 배정: ch0/ch1/ch2
 
         std::ifstream in(path);
@@ -212,7 +212,10 @@ private:
             }
             fprintf(fp, "# 포트 배정 및 센서 지문 (MS5837 PROM C1~C6) — i2c_driver_node 가 자동 생성\n");
             fprintf(fp, "#\n");
-            fprintf(fp, "# verified: no      <- 물리 확인 후 yes 로 바꾸십시오\n");
+            // 이 줄에 "yes" 라는 글자를 넣지 말 것 — 파서가 "verified:" 뒤 첫 토큰만
+            // 보긴 하지만, 안내문이 판정에 섞이는 사고를 애초에 못 내게 한다.
+            fprintf(fp, "# verified: no\n");
+            fprintf(fp, "#   ^ 물리 확인이 끝나면 위 줄의 no 를 바꿔 적으십시오\n");
             fprintf(fp, "#   앞 확정 : 노즈 포트에 입으로 바람을 불어 그 채널만 오르는지\n");
             fprintf(fp, "#   좌우 확정: 우현을 아래로 30도 기울여 우 포트가 약 4.3 mbar 높은지\n");
             fprintf(fp, "#\n");
@@ -233,8 +236,15 @@ private:
         bool verified = false, mismatch = false, any = false;
         std::string line;
         while (std::getline(in, line)) {
-            if (line.find("verified:") != std::string::npos && line.find("yes") != std::string::npos)
-                verified = true;
+            // **"verified:" 뒤의 첫 토큰만 본다.** 줄 안에 "yes" 가 있는지로 판정하면
+            // 안내문("... 후 yes 로 바꾸십시오")이 자기 자신을 통과시킨다 — 실제로
+            // verified: no 인 파일을 "물리확인 완료"로 보고하고 있었다(2026-08-25).
+            const size_t vp = line.find("verified:");
+            if (vp != std::string::npos) {
+                std::istringstream vs(line.substr(vp + 9));
+                std::string tok;
+                if (vs >> tok) verified = (tok == "yes");
+            }
             if (line.empty() || line[0] == '#') continue;
             std::istringstream ss(line);
             std::string role; int ch = -1; unsigned c[7] = {0};

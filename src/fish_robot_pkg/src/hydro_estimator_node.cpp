@@ -302,7 +302,10 @@ private:
         K_ = rho_ * gravity_ / 100.0;
 
         const char *home = getenv("HOME");
-        const std::string base = home ? (std::string(home) + "/ros2_ws/log_csv/") : "./log_csv/";
+        // **config/ 다. log_csv/ 가 아니다.** log_csv/ 는 지워도 되는 로그가 쌓이는 곳이라
+        // 정리 한 번에 영점·배정이 같이 날아간다 — 2026-08-25 에 지자기 보정 파일이
+        // 그렇게 사라져 EKF 가 기본값으로 돌고 있었다(docs/imu_detailed.md §10.1).
+        const std::string base = home ? (std::string(home) + "/ros2_ws/config/") : "./config/";
         port_map_path_ = this->declare_parameter<std::string>("port_map_path", base + "port_map.txt");
         zero_path_     = this->declare_parameter<std::string>("zero_file_path", base + "hydro_zero.txt");
     }
@@ -374,8 +377,15 @@ private:
         bool verified = false;
         std::string line;
         while (std::getline(f, line)) {
-            if (line.find("verified:") != std::string::npos && line.find("yes") != std::string::npos)
-                verified = true;
+            // **"verified:" 뒤의 첫 토큰만 본다.** 줄 안에 "yes" 가 있는지로 판정하면
+            // 안내문("... 후 yes 로 바꾸십시오")이 자기 자신을 통과시킨다 — 실제로
+            // verified: no 인 파일을 "물리확인 완료"로 보고하고 있었다(2026-08-25).
+            const size_t vp = line.find("verified:");
+            if (vp != std::string::npos) {
+                std::istringstream vs(line.substr(vp + 9));
+                std::string tok;
+                if (vs >> tok) verified = (tok == "yes");
+            }
             if (line.empty() || line[0] == '#') continue;
             std::istringstream ss(line);
             std::string role; int ch = -1;
