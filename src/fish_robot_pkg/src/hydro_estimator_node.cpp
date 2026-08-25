@@ -793,7 +793,10 @@ private:
                 }
                 q_out = (float)q_lpf_;
 
-                // 데드밴드는 q 공간에서. 필터 후 sigma = sigma/sqrt(2*tau/dt) 근사.
+                // 1차 IIR 의 정상상태 잡음 감쇠: sigma_f/sigma = sqrt(a/(2-a)), a = dt/(tau+dt).
+                // a<<1 이면 sqrt(dt/2tau) = 1/sqrt(2*tau*f) 로 근사된다(tau=1s, f=11 에서 2% 과대).
+                // **q_lpf_ 와 비교하는 문턱은 전부 이 값을 써야 한다.** 원시 sigma 를 쓰면
+                // 실효 문턱이 14배로 뛴다 — 아래 뒤바뀜 감시가 실제로 그 실수를 하고 있었다.
                 const double sig_f = q_sigma_ / std::sqrt(std::max(1.0, 2.0 * q_lpf_tau_ * 11.0));
                 const double band  = q_deadband_n_ * sig_f;
                 if (std::abs(q_lpf_) < band) {
@@ -808,7 +811,16 @@ private:
                 // 배정 뒤바뀜 감시 — 꼬리가 도는데 q 가 계속 큰 음수면 앞/옆이 바뀐 것이다.
                 // PROM 지문(i2c_driver_node)은 **센서 교체**를 잡지만 튜브만 옮긴 경우는
                 // 압력값으로만 구별된다. 그 구멍을 이 감시가 메운다.
-                if (tail_rpm_ > 0 && q_lpf_ < -3.0 * q_sigma_) {
+                //
+                // 앞 튜브와 옆 튜브가 바뀌면 보고된 "앞"이 정압, 보고된 "옆" 하나가 전압이 되어
+                //   q = 정압 - (전압+정압)/2 = -(전압-정압)/2 = **-(참값)/2**
+                // 즉 부호가 뒤집히고 크기가 절반이 된다. 그래서 음수가 결정적 증거다.
+                //
+                // 문턱은 **필터 후 sigma** 로 잡는다. 원시 sigma(0.189)를 쓰면 문턱이 0.567 mbar 가
+                // 되는데 그건 필터된 값 기준으로 14.1 sigma 라, 0.48 m/s 아래의 뒤바뀜을 통째로
+                // 놓친다. 하필 **첫 물 시험이 저속**이고 그때가 배선을 확인해야 할 때다.
+                // sig_f 로 바꾸면 0.22 m/s 까지 내려간다.
+                if (tail_rpm_ > 0 && q_lpf_ < -3.0 * sig_f) {
                     if (++q_neg_run_ == 55) {   // ~5초
                         flags |= FLAG_Q_NEGATIVE;
                         RCLCPP_ERROR(this->get_logger(),
