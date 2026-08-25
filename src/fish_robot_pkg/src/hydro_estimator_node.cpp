@@ -135,7 +135,7 @@ static constexpr uint32_t FLAG_SPEED_OK   = 0x002;   // 속도/q 유효
 static constexpr uint32_t FLAG_ATM_ZERO   = 0x004;   // 대기압 영점 확보
 static constexpr uint32_t FLAG_Q_ZERO     = 0x008;   // 물속 q 영점 확보
 static constexpr uint32_t FLAG_ATT_FRESH  = 0x010;   // 자세 신선 (지연 보간 성공)
-static constexpr uint32_t FLAG_ATT_FALLBK = 0x020;   // 자세 없음 -> 기준 피치 상수로 폴백
+static constexpr uint32_t FLAG_ATT_MISSING = 0x020;  // 자세 없음 -> **속도를 내지 않는다**(NaN)
 static constexpr uint32_t FLAG_FRONT_DEAD = 0x040;   // 앞(정체압) 포트 사망
 static constexpr uint32_t FLAG_LEFT_DEAD  = 0x080;   // 좌 정압 포트 사망
 static constexpr uint32_t FLAG_RIGHT_DEAD = 0x100;   // 우 정압 포트 사망
@@ -281,10 +281,6 @@ private:
 
         pressure_lag_ms_ = this->declare_parameter<double>("pressure_lag_ms", 72.0);
         att_timeout_ms_  = this->declare_parameter<double>("attitude_timeout_ms", 300.0);
-        // 자세가 없을 때 쓰는 피치. NaN 대신 이걸 쓰는 이유는 1차 목적이 압력 데이터
-        // 확보이고, 직진·수평이면 상수 가정의 비용이 실제 편차 ±2도에서 ±0.6 mbar 라
-        // 나쁘지만 무용하진 않기 때문이다. 플래그가 신뢰도를 알려준다.
-        mount_pitch_deg_ = this->declare_parameter<double>("mount_baseline_pitch_deg", 7.9);
 
         // **q 를 먼저 필터링하고 그 다음에 제곱근**을 취한다. 반대로 하면 부호 채터를
         // 데드밴드로 정리할 수 없고 Jensen 부등식으로 저속에서 편향이 생긴다.
@@ -339,11 +335,13 @@ private:
 
         // 부호 자가검증 — 함정 1(피치 부호)과 함정 2(u_up vs g)를 매 부팅마다 잡는다.
         // 코를 아래로 기울이면 앞 포트가 더 깊이 잠기므로 **양수**가 나와야 한다.
+        // 10도는 물리 상수가 아니라 **자체 시험용 각도**다. 로봇의 실제 자세와 무관하다.
         {
-            const double d = dP_hydro_of(0.0, mount_pitch_deg_);
+            const double TEST_DEG = 10.0;
+            const double d = dP_hydro_of(0.0, TEST_DEG);
             RCLCPP_INFO(this->get_logger(),
-                "[Hydro] 부호 검증: pitch=+%.1f도(기수 아래), roll=0 -> dP_hydro=%+.3f mbar "
-                "(앞 포트가 더 깊음 -> 더 높은 압력)", mount_pitch_deg_, d);
+                "[Hydro] 부호 검증: pitch=+%.0f도(기수 아래), roll=0 -> dP_hydro=%+.3f mbar "
+                "(앞 포트가 더 깊음 -> 더 높은 압력)", TEST_DEG, d);
             if (d <= 0.0)
                 RCLCPP_ERROR(this->get_logger(),
                     "[Hydro] ** 부호가 음수입니다 — 축/부호 오류. 이 상태의 속도는 신뢰할 수 없습니다. **");
@@ -752,7 +750,7 @@ private:
             q_raw = (float)((double)p[ch_front_] - ssum / ns);
 
             // 자세를 **압력이 대표하는 과거 시각**에서 꺼낸다.
-            double roll_u, pitch_u; bool att_sat = false;
+            double roll_u, pitch_u; bool att_sat = false, have_att = false;
             const rclcpp::Time t_eff = last_press_time_ - rclcpp::Duration::from_seconds(pressure_lag_ms_ * 1e-3);
             if (attitude_at(t_eff, roll_u, pitch_u, att_sat)) {
                 flags |= FLAG_ATT_FRESH;
@@ -765,20 +763,32 @@ private:
                         "지연 보정이 사실상 꺼진 상태입니다. 자세 스트림(100Hz)을 확인하십시오.",
                         pressure_lag_ms_);
                 }
+                pitch_used = (float)pitch_u;
+                dph = (float)dP_hydro_of(roll_u, pitch_u);
+                last_pitch_used_ = pitch_used; last_dph_ = dph;
+                have_att = true;
             } else {
-                // 자세가 없으면 장착 기준 피치로 폴백한다. 기동 직후 수 초간
-                // /filtered/attitude_ekf 가 아예 없는 것은 **정상**이므로 ERROR 를 찍지 않는다.
-                roll_u = 0.0; pitch_u = mount_pitch_deg_;
-                flags |= FLAG_ATT_FALLBK;
+                // **자세가 없으면 속도를 내지 않는다.** 상수 피치로 가정해 계속 내는
+                // 폴백을 두었다가 없앴다(2026-08-25). 이유:
+                //   1) 추측한 자세로 만든 속도는 측정이 아니라 창작이다. 이 프로젝트는
+                //      압력 채널에 대해 **이미 같은 결정**을 했다 — 데이터 없음은 0.0이
+                //      아니라 NaN이다(i2c_driver_node.cpp:282-296). 같은 원칙을 적용한다.
+                //   2) **잃는 데이터가 없다.** 원시 차압 q_raw 는 자세와 무관하게 그대로
+                //      발행·기록되므로, 나중에 어떤 자세 가정으로든 오프라인에서 다시
+                //      계산할 수 있다. 폴백이 지켜주던 것이 애초에 없었다.
+                //   3) 상수의 근거가 사라졌다. 장착 기준 피치 7.9도는 2026-08-04 에 한 번
+                //      잰 값인데, 3.87일 벤치 실측은 -0.45도(범위 -1.03~+0.38)였고 다른
+                //      날은 +5.83도였다. 놓는 방식에 좌우되는 값이라 상수가 될 수 없다.
+                // 기동 직후 수 초간 자세가 없는 것은 **정상**이므로 ERROR 가 아니라 WARN 이다.
+                flags |= FLAG_ATT_MISSING;
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
-                    "[Hydro] 자세 없음 -> 피치 %.1f도 상수로 폴백. 속도 신뢰도가 떨어집니다.", mount_pitch_deg_);
+                    "[Hydro] 자세가 없어 속도를 내지 않습니다(NaN). 원시 차압 Q_raw 는 계속 기록되므로 "
+                    "나중에 오프라인 재계산이 가능합니다.");
             }
-            pitch_used = (float)pitch_u;
-            dph = (float)dP_hydro_of(roll_u, pitch_u);
-            last_pitch_used_ = pitch_used; last_dph_ = dph;
 
-            if (q_zero_captured_) {
-                flags |= FLAG_Q_ZERO;
+            if (q_zero_captured_) flags |= FLAG_Q_ZERO;
+
+            if (have_att && q_zero_captured_) {
                 const double q_corr = (double)q_raw - (double)dph - q_offset_;
 
                 // 필터를 먼저, 제곱근은 나중. NaN 한 개가 IIR 상태를 영구히 오염시키므로
@@ -832,7 +842,9 @@ private:
             }
 
             // 물속 q 영점 자동 포착 (기본 꺼짐). 켤 때의 게이트는 collect_q_zero 참조.
-            if (q_zero_collecting_) collect_q_zero(q_raw, dph, static_gauge);
+            // 자세가 없으면 dph 가 NaN 이라 수집해도 무의미하다. 명시적으로 막는다 —
+            // q 영점은 세션 내내 쓰는 상수라 한 번 오염되면 모든 속도가 틀어진다.
+            if (q_zero_collecting_ && have_att) collect_q_zero(q_raw, dph, static_gauge);
         }
 
         auto out = std_msgs::msg::Float32MultiArray();
@@ -940,6 +952,13 @@ private:
         if ((this->now() - last_press_time_).seconds() > press_timeout_) {
             res->success = false; res->message = "압력 스트림이 정지 상태입니다."; return;
         }
+        // 자세가 없으면 dP_hydro 를 못 구해 영점이 무의미하다. q 영점은 세션 내내 쓰는
+        // 상수라 한 번 오염되면 모든 속도가 틀어지므로, 조용히 실패하지 말고 여기서 막는다.
+        if ((this->now() - last_att_time_).seconds() > att_timeout_ms_ * 1e-3) {
+            res->success = false;
+            res->message = "자세가 없습니다 — dP_hydro 를 못 구해 영점이 무의미합니다. IMU/EKF 를 확인하십시오.";
+            return;
+        }
         q_acc_.clear();
         q_zero_collecting_ = true;
         q_collect_start_   = this->now();
@@ -1013,7 +1032,7 @@ private:
     // ---- 파라미터 ----
     double rho_, gravity_, mbar_per_m_, K_;
     double lever_x_, lever_y_, lever_z_, speed_k_;
-    double pressure_lag_ms_, att_timeout_ms_, mount_pitch_deg_;
+    double pressure_lag_ms_, att_timeout_ms_;
     double q_lpf_tau_, q_sigma_, q_deadband_n_, q_offset_max_, q_spread_max_, min_submerged_;
     double q_collect_timeout_;
     int    q_window_;
