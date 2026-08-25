@@ -254,6 +254,11 @@ ls -l /proc/*/exe 2>/dev/null | grep '(deleted)'                                
 - **Accelerometer needs no calibration** — axis radii agree to 0.3 %; the earlier "~2 % asymmetry"
   claim was an underdetermined-fit artifact (§7.3).
 
+## What to do next
+
+Working checklist, ordered so each item unblocks the next: **`docs/todo.md`**.
+It carries the water-vs-bench split, the "must be done before water" items, and the open decisions.
+
 ## Known gaps (open)
 
 | Gap | Notes |

@@ -214,7 +214,7 @@ private:
             fprintf(fp, "#\n");
             fprintf(fp, "# verified: no      <- 물리 확인 후 yes 로 바꾸십시오\n");
             fprintf(fp, "#   앞 확정 : 노즈 포트에 입으로 바람을 불어 그 채널만 오르는지\n");
-            fprintf(fp, "#   좌우 확정: 우현을 아래로 30도 기울여 우 포트가 약 5.8 mbar 높은지\n");
+            fprintf(fp, "#   좌우 확정: 우현을 아래로 30도 기울여 우 포트가 약 4.3 mbar 높은지\n");
             fprintf(fp, "#\n");
             fprintf(fp, "# 역할   채널  C1     C2     C3     C4     C5     C6\n");
             for (int i = 0; i < 3; i++) {

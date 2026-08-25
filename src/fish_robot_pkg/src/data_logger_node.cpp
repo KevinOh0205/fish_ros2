@@ -13,6 +13,7 @@
 //          /raw/imu_6dof               (Imu)                  원시 6축 — g, 도/초 그대로
 //          /raw/magnetometer           (Vector3)              원시 지자기[µT], 보정 전 칩 축
 //          /filtered/ekf_status        (Float32MultiArray[12]) [0..2] 자이로 바이어스, [10] 플래그
+//          /filtered/hydro             (Float32MultiArray[8])  수심[m]·속도[m/s]·동압·자세보정
 //   [출력] ~/ros2_ws/log_csv/fish_log_YYYYMMDD_HHMMSS.csv
 //
 //  설계 : 콜백은 값을 멤버 변수에 "저장만" 하고, 10ms 타이머가 그 순간의
@@ -22,7 +23,7 @@
 //  원시값 3종을 상시 기록하는 이유(2026-08-18): 물속 운용은 재현이 안 된다.
 //  융합 결과만 남으면 자세 이상이 "센서 탓인지 필터 탓인지" 사후 규명이 불가능하다.
 //
-//  ※ 크기: 100Hz x 39컬럼 ≈ 시간당 84MB. 파일당 200MB(약 2.4시간)에서 새 파일로
+//  ※ 크기: 100Hz x 47컬럼 ≈ 시간당 99MB. 파일당 200MB(약 2.0시간)에서 새 파일로
 //     회전하며, Time(s) 축은 회전을 넘어 이어진다(기동 시각 기준 유지). 오래된
 //     파일은 지우지 않는다 — log_csv/에는 실험 CSV와 지자기 보정 파일이 같이
 //     살므로 자동 삭제는 위험하다. 총량 관리는 사람 몫.
@@ -85,6 +86,14 @@ public:
         mx_ = 0.0f; my_ = 0.0f; mz_ = 0.0f;             // 원시 지자기 [µT]
         bias_x_ = 0.0f; bias_y_ = 0.0f; bias_z_ = 0.0f; // EKF 자이로 바이어스 추정 [도/초]
         ekf_flags_ = 0;
+        // hydro 열도 NaN 으로 시작한다. Depth=0.0, Speed=0.0 은 완벽하게 정상인
+        // 값이라, 0 초기화는 "노드 미가동"과 "수면에 정지"를 구별 불가능하게 만든다.
+        {
+            const float nf = std::numeric_limits<float>::quiet_NaN();
+            depth_ = nf; speed_ = nf; q_dyn_ = nf; q_raw_ = nf;
+            p_hydro_ = nf; hydro_pitch_ = nf;
+        }
+        hydro_seq_ = 0; hydro_flags_ = 0;
 
         received_attitude_ = false;
         received_pressure_ = false;
@@ -123,6 +132,9 @@ public:
 
         ekf_status_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
             "/filtered/ekf_status", 10, std::bind(&DataLoggerNode::ekf_status_callback, this, std::placeholders::_1));
+
+        hydro_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+            "/filtered/hydro", 10, std::bind(&DataLoggerNode::hydro_callback, this, std::placeholders::_1));
 
         // 100Hz 기록 타이머 (모든 토픽의 최신 스냅샷을 한 줄로)
         logging_timer_ = this->create_wall_timer(
@@ -177,9 +189,15 @@ private:
         //    (원시 - 보정) = EKF가 잡은 대기압 영점이 사후에 그대로 복원된다.
         //    수심·피토 차압을 나중에 다른 상수로 다시 계산하려면 이 원본이 필요하다.
         //    죽은 채널은 nan으로 찍힌다 (0.0 아님).
+        // 40~47열: hydro. Hydro_Pitch 는 5~7열 Roll/Pitch 로 대체할 수 없다 —
+        //   ① 오프라인 복원에 pressure_lag_ms 가 필요한데 그게 바로 구하려는 미지수다(순환)
+        //   ② 없으면 Q_dyn = Q_raw - P_hydro - q_offset 을 감사할 수 없다
+        //   ③ pitch 는 두 토픽에서 같은 값이라, 6열과의 상호상관 지연이 곧 파이프라인
+        //      지연이다 — 열 하나로 공짜 지연 측정기를 얻는다
         fprintf(fp_, "Time(s),Btn1_Count,Mode,AutoMode,Roll,Pitch,Yaw,RC_T,RC_R,RC_P,RC_Y,M1,M2,M3,M4,RPM,P0_cal,P1_cal,P2_cal,T0,T1,T2,RSSI,"
                      "AX,AY,AZ,GX,GY,GZ,MX,MY,MZ,BiasX,BiasY,BiasZ,EKF_Flags,"
-                     "P0_raw,P1_raw,P2_raw\n");
+                     "P0_raw,P1_raw,P2_raw,"
+                     "Depth,Speed,Q_dyn,Q_raw,P_hydro,Hydro_Pitch,Hydro_Seq,Hydro_Flags\n");
         fflush(fp_);   // 헤더는 즉시 기록해 파일이 비어 보이지 않게 한다
 
         return 0;
@@ -322,6 +340,21 @@ private:
         ekf_flags_ = static_cast<int32_t>(msg->data[10]);
     }
 
+    // /filtered/hydro = [depth, speed, q, q_raw, dP_hydro, static, pitch_used, flags]
+    void hydro_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+        if (msg->data.size() < 8) return;
+        note_first_arrival(received_hydro_, "수심/속도(hydro)");
+        depth_       = msg->data[0];
+        speed_       = msg->data[1];
+        q_dyn_       = msg->data[2];
+        q_raw_       = msg->data[3];
+        p_hydro_     = msg->data[4];
+        hydro_pitch_ = msg->data[6];
+        hydro_flags_ = static_cast<int32_t>(msg->data[7]);
+        hydro_seq_++;   // 11Hz 신호가 100Hz CSV에서 같은 값 9행으로 늘어나므로,
+                        // 새 샘플이 어느 행에 떨어졌는지 이것 없이는 식별 불가다
+    }
+
     void write_log_loop() {
         // 센서 연결 여부와 무관하게 노드 기동 즉시 로깅을 시작한다.
         // (이전에는 received_attitude_ && received_pressure_ 를 요구했는데, 압력센서를
@@ -348,7 +381,8 @@ private:
         //         기존 %.2f로도 버티지만, 사후 재계산의 원본이라 잘라 둘 이유가 없다.
         fprintf(fp_, "%.3f,%d,%d,%d,%.2f,%.2f,%.2f,%d,%d,%d,%d,%u,%u,%u,%u,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,"
                      "%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%d,"
-                     "%.3f,%.3f,%.3f\n",
+                     "%.3f,%.3f,%.3f,"
+                     "%.4f,%.3f,%.4f,%.4f,%.4f,%.2f,%d,%d\n",
                 relative_time_sec,
                 btn1_cumulative_count_,
                 mode_,
@@ -365,7 +399,8 @@ private:
                 mx_, my_, mz_,
                 bias_x_, bias_y_, bias_z_,
                 ekf_flags_,
-                p0_raw_, p1_raw_, p2_raw_);
+                p0_raw_, p1_raw_, p2_raw_,
+                depth_, speed_, q_dyn_, q_raw_, p_hydro_, hydro_pitch_, hydro_seq_, hydro_flags_);
 
         // 50줄(0.5초)마다 디스크로 강제 플러시.
         // 매 줄 플러시하면 SD카드 I/O로 100Hz 루프가 밀리고, 아예 안 하면
@@ -397,6 +432,7 @@ private:
 
     bool received_attitude_;    // 최초 수신 로그를 한 번만 찍기 위한 래치
     bool received_pressure_;
+    bool received_hydro_ = false;
     bool is_logging_active_;
     rclcpp::Time start_time_;   // Time(s) 컬럼의 기준 시각
 
@@ -416,6 +452,8 @@ private:
     float p0_cal_, p1_cal_, p2_cal_;
     float t0_, t1_, t2_;      // 채널별 원시 온도(C) — 압력 드리프트 진단용
     float p0_raw_, p1_raw_, p2_raw_;  // 채널별 원시 절대압(mbar, 영점 전). 고장/미수신 = NaN
+    float depth_, speed_, q_dyn_, q_raw_, p_hydro_, hydro_pitch_;   // hydro. 미수신 = NaN
+    int32_t hydro_seq_, hydro_flags_;
     int32_t rssi_;
     float ax_, ay_, az_, gx_, gy_, gz_;      // 원시 6축 [g, 도/초]
     float mx_, my_, mz_;                     // 원시 지자기 [µT], 보정 전 칩 축
@@ -435,6 +473,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_raw_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr mag_raw_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr ekf_status_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr hydro_sub_;
 };
 
 int main(int argc, char **argv) {
