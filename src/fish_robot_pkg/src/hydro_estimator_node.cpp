@@ -563,17 +563,20 @@ private:
             // 잠정값을 들고 있으면 실패해도 치명적이지 않다 — 물속 respawn 이 정확히
             // 이 경우다(게이트가 물속 포착을 막아준다). 그래서 잠정값이 있을 때는
             // 몇 번만 시도하고 조용해진다. 없으면 성공할 때까지 계속 시도한다.
-            if (atm_provisional_) {
+            if (atm_captured_) {
+                // 쓸 수 있는 값을 이미 들고 있으면 실패해도 치명적이지 않다.
+                // 물속 respawn·물속 btn1 이 정확히 이 경우다(게이트가 막아준다).
                 if (++atm_retry_ <= 3) {
                     RCLCPP_WARN(this->get_logger(),
-                        "[Hydro] 대기압 재포착 실패 (%d/3) — 잠정값을 유지합니다. 물속이면 정상입니다.\n%s",
+                        "[Hydro] 대기압 재포착 실패 (%d/3) — 기존 영점을 유지합니다. 물속이면 정상입니다.\n%s",
                         atm_retry_, report.c_str());
                 } else if (atm_retry_ == 4) {
                     RCLCPP_WARN(this->get_logger(),
-                        "[Hydro] 대기압 재포착을 포기하고 잠정값으로 계속 갑니다. "
+                        "[Hydro] 대기압 재포착을 포기하고 기존 영점으로 계속 갑니다. "
                         "공기 중으로 꺼낸 뒤 btn1 롱프레스로 다시 잡으십시오.");
+                    atm_provisional_ = false;   // 더 시도하지 않는다
+                    force_recapture_ = false;
                 }
-                if (atm_retry_ > 3) atm_provisional_ = false;   // 더 시도하지 않는다
             } else {
                 RCLCPP_ERROR(this->get_logger(), "[Hydro] 대기압 영점 포착 실패 — 다시 시도합니다\n%s", report.c_str());
             }
@@ -766,6 +769,7 @@ private:
         float static_gauge = nan_f, depth = nan_f;
         if (n > 0) {
             static_gauge = (float)(sum / n);
+            last_static_gauge_ = static_gauge;
             depth        = (float)(sum / n / mbar_per_m_);
             flags |= FLAG_DEPTH_OK;
             // 하나만 살아남으면 좌우 평균의 롤 상쇄가 깨진다 — 수심이 자세
@@ -982,10 +986,13 @@ private:
     // 재포착 진입점 하나 — 서비스와 버튼이 같은 경로를 쓴다.
     // 웜업을 건너뛴다: 이미 켜져 있던 센서라 예열이 끝났고, 재영점을 누른 사람은
     // 지금 다시 잡히기를 기대한다.
+    // **기존 영점을 버리지 않는다.** 예전에는 atm_captured_ 를 즉시 false 로 놓았는데,
+    // 그러면 물속에서 btn1 을 누르는 순간 수심이 NaN 이 되고 재포착은 게이트에 막혀
+    // 영영 실패하므로 **그 잠수 내내 수심이 안 나왔다.** 새 값이 성공해야 교체한다.
     void start_recapture(const char *who) {
         reset_collection();
         force_recapture_ = true;
-        atm_captured_    = false;
+        atm_retry_       = 0;
         RCLCPP_WARN(this->get_logger(), "[Hydro] 대기압 영점 재포착 시작 (%s, %d샘플 약 %.0f초) — 로봇을 흔들지 마십시오.",
                     who, atm_window_, atm_window_ / 11.0);
     }
@@ -1022,6 +1029,40 @@ private:
             q_window_, q_window_ / 11.0);
         res->success = true;
         res->message = "수집 시작 — 결과는 저널에 남습니다. 꼬리를 멈추고 흐름이 없게 하십시오.";
+    }
+
+    // btn1 롱프레스 = "지금 상황에 맞는 영점을 잡아라".
+    //
+    // 공기와 물속은 요구가 반대라 하나의 동작으로 묶을 수 없다. 그래서 잠김 여부로
+    // 가른다. 판정 문턱을 둘로 두고 **애매한 구간은 추측하지 않고 거부**한다:
+    //   < 5 mbar   공기  — 하루 지난 영점의 최악 표류 3.4 mbar(3.87일 실측)보다 여유
+    //   > 15 mbar  물속  — 기울기 시험이 어차피 40 cm 를 요구하니 15 cm 미만은 쓸 일이 없다
+    //   그 사이     거부  — 틀린 쪽을 고르면 영점이 통째로 오염된다
+    void btn1_long_press() {
+        const bool have_static = std::isfinite(last_static_gauge_);
+        if (!atm_captured_ || !have_static) {
+            // 대기압 영점이 아예 없으면 게이지압을 못 구한다. 그 상태는 사실상 첫 기동이고
+            // 공기 중일 수밖에 없으므로 공기 경로로 간다.
+            start_recapture("버튼1 롱프레스");
+            return;
+        }
+        const double g = last_static_gauge_;
+        if (g < 5.0) {
+            RCLCPP_INFO(this->get_logger(), "[Hydro] 공기 중으로 판정 (게이지압 %.2f mbar) -> 대기압 영점 + 공기 Δb", g);
+            start_recapture("버튼1 롱프레스");
+        } else if (g > 15.0) {
+            RCLCPP_INFO(this->get_logger(), "[Hydro] 잠김으로 판정 (게이지압 %.2f mbar, 약 %.0f cm) -> 물속 q 영점",
+                        g, g / mbar_per_m_ * 100.0);
+            auto req = std::make_shared<std_srvs::srv::Trigger::Request>();
+            auto res = std::make_shared<std_srvs::srv::Trigger::Response>();
+            handle_zero_q(req, res);
+            if (!res->success)
+                RCLCPP_ERROR(this->get_logger(), "[Hydro] 물속 q 영점 거부: %s", res->message.c_str());
+        } else {
+            RCLCPP_ERROR(this->get_logger(),
+                "[Hydro] 공기인지 물속인지 판정할 수 없습니다 (게이지압 %.2f mbar). "
+                "물 밖으로 꺼내거나 15 cm 이상 잠기게 한 뒤 다시 누르십시오.", g);
+        }
     }
 
     void collect_q_zero(float q_raw, float dph, float static_gauge) {
@@ -1079,7 +1120,7 @@ private:
 
         if (btn1 == 1) {
             btn1_counter_++;
-            if (btn1_counter_ == 300) start_recapture("버튼1 롱프레스");   // >= 가 아니라 == : 1회만
+            if (btn1_counter_ == 300) btn1_long_press();   // >= 가 아니라 == : 1회만
         } else {
             btn1_counter_ = 0;
         }
@@ -1129,6 +1170,7 @@ private:
     bool          q_lpf_seeded_      = false;
     int           q_neg_run_         = 0;
     float         last_pitch_used_   = 0.0f, last_dph_ = 0.0f;
+    float         last_static_gauge_ = std::numeric_limits<float>::quiet_NaN();
     rclcpp::Time q_collect_start_;
     rclcpp::Time node_start_time_, last_press_time_;
 
