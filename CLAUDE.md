@@ -205,10 +205,15 @@ clamp events, because its fixed `Kp·dt` correction step must stay bounded. §1.
   `magneto_cal.py`: refuses to save above 8 % scatter, backs up the old file, and the EKF node
   auto-reloads on success, no restart (§4.3, §9).
 - **Calibration is tied to the ASSEMBLY, not the place** — any part change invalidates it.
-  Recalibrated assembled 2026-08-17: scatter 6.1 %, dip 137.2°, 360° spin ratio 1.00; hard iron
-  changed completely, (−12.3, +23.5, −89.8) → (+9.9, +61.6, −16.1) µT (§9). Tumble in one spot,
+  Recalibrated 2026-08-25 (pressure assembly): **scatter 3.4 %, dip 140.3° vs 143 expected** — the
+  best yet; hard iron (−7.5, +20.5, −83.8) µT, back to chip-Z dominance like the 08-06 strip state.
+  Supersedes 2026-08-17 assembled (6.1 %, 137.2°, (+9.9, +61.6, −16.1)) (§9, §10.2). Tumble in one spot,
   ≥1 m from steel; **never calibrate from a flat spin** (it cannot see the vertical offset). File:
-  `~/ros2_ws/log_csv/mag_calib_params.txt`. (A stale `mag_calib.txt` sat at the workspace root,
+  `~/ros2_ws/log_csv/mag_calib_params.txt`. **That file went missing before 2026-08-25** and the EKF
+  ran on source-code defaults (dip 11.1° — physically impossible, and it said so in an ERROR every
+  boot). `log_csv/` mixes disposable logs with three files that must never be deleted —
+  `mag_calib_params.txt`, `port_map.txt`, `hydro_zero.txt` — and **all three fail silently**, one WARN
+  then defaults. Check them before any log cleanup (§10.1). (A stale `mag_calib.txt` sat at the workspace root,
   read by nothing — deleted 2026-08-25. It held June-9 **min/max** values, the method retired for
   measuring *worse than no calibration*, so it looked restorable but would have made things worse.)
 - **A bad mag vector corrupted Mahony's roll/pitch** (5.0°/1.7° measured), not just yaw; the EKF's
@@ -266,7 +271,7 @@ It carries the water-vs-bench split, the "must be done before water" items, and 
 
 | Gap | Notes |
 |---|---|
-| AK8963 ASA ROM (0x10–0x12) never read | \|m\| reads 30 % low (34.7 vs ~50 µT). Magnitude-only — heading/attitude unaffected; fixing it forces recalibration. §4.1 |
+| AK8963 ASA ROM (0x10–0x12) never read | \|m\| reads 30 % low (35.8 vs ~50 µT, 2026-08-25). Magnitude-only — heading/attitude unaffected; fixing it forces recalibration. §4.1 |
 | Thermal drift near the sensor | 3 µT (≈8° heading) after CPU load, noise ~×3 — may cap accuracy. §4.7 |
 | Gyro z bias session-unstable | −0.044 vs −2.2 °/s hours apart (50×); the EKF absorbs it online. §3.2 |
 | `gyro_noise_sigma` validated 2026-08-17 | Allan (2 h, 711k samples): ARW 0.0060–0.0078 °/s/√Hz, bias instability 0.0011–0.0024 °/s at τ 69–434 s. The 0.05 setting is a measured 6.4–8.3× headroom, no longer a guess; `bias_tau` 1000 s and `gyro_bias_rw_sigma` 0.002 are consistent. §3.3 |
