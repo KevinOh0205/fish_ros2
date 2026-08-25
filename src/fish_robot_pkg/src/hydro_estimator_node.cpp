@@ -152,6 +152,9 @@ public:
 
         node_start_time_ = this->now();
         last_press_time_ = this->now();
+        // 기본 생성된 rclcpp::Time 은 시계 종류가 달라 this->now() 와 빼면 예외가 난다.
+        // 디스크에서 영점을 적재하면 압력이 오기 전에 btn1 판정에 닿을 수 있다.
+        last_static_gauge_time_ = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
         last_att_time_   = this->now() - rclcpp::Duration::from_seconds(3600.0);   // "아직 없음"
         q_collect_start_ = this->now();
 
@@ -171,7 +174,7 @@ public:
         pressure_cal_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
             "/sensor/pressure_calibrated", 10);
 
-        // btn1 롱프레스(정확히 3초) = 대기압 재영점. EKF에서 이관했다 —
+        // btn1 롱프레스(정확히 3초) = 대기압 재영점(공기 중 전용). EKF에서 이관했다 —
         // 버튼을 해석하는 곳이 늘어난 게 아니라 옮겨간 것이다.
         rc_status_sub_ = this->create_subscription<std_msgs::msg::Int32MultiArray>(
             "/rc/status", 10,
@@ -322,7 +325,7 @@ private:
                     atm_zero_max_age_ / 3600.0, q_zero_max_age_ / 3600.0);
         RCLCPP_INFO(this->get_logger(), "[Hydro] 출력: /filtered/hydro [depth, speed, q, q_raw, dP_hydro, static, pitch, flags]");
         RCLCPP_INFO(this->get_logger(), "[Hydro]       /sensor/pressure_calibrated (EKF에서 이관 — 발행자는 반드시 1개)");
-        RCLCPP_INFO(this->get_logger(), "[Hydro] 재영점: btn1 롱프레스 3초, 또는 서비스 /hydro/zero_atm");
+        RCLCPP_INFO(this->get_logger(), "[Hydro] 재영점: btn1 롱프레스 3초(공기 중에서만), 또는 서비스 /hydro/zero_atm");
         RCLCPP_INFO(this->get_logger(), "[Hydro] q 영점: %s  (물속 재포착: /hydro/zero_q)",
                     !q_zero_captured_ ? "**미확보** — 대기압 영점 포착 때 공기 Δb 로 자동으로 채웁니다"
                                       : (q_zero_from_air_ ? "공기 Δb (물속에서 다시 잡으면 더 정확)" : "물속 실측"));
@@ -515,15 +518,20 @@ private:
         collect_msgs_++;
         if (collect_msgs_ < atm_window_) return;
 
-        // 채널별로 독립 판정한다 — 한 채널이 죽어도 나머지는 영점을 잡는다
+        // 채널별로 독립 판정한다 — 한 채널이 죽어도 나머지는 영점을 잡는다.
+        //
+        // **결과를 임시 배열에 모은 뒤 성공한 채널만 반영한다.** 예전에는 거부할 때
+        // atm_offset_[i] 에 곧바로 NAN 을 넣었는데, 그러면 물속에서 btn1 을 잘못 눌러
+        // 재포착이 거부당하는 순간 **멀쩡하던 영점 숫자가 지워져 수심이 NaN 이 됐다.**
+        // (atm_captured_ 를 지키는 것만으로는 부족했다 — 실제 숫자가 여기 있다.)
         int ok_count = 0;
+        float new_off[3] = { NAN, NAN, NAN };
         std::string report;
         for (int i = 0; i < 3; i++) {
             char buf[160];
             if ((int)acc_[i].size() < atm_window_ / 2) {
                 snprintf(buf, sizeof(buf), "  ch%d: 유효샘플 %zu개 부족 -> 영점 없음\n", i, acc_[i].size());
                 report += buf;
-                atm_offset_[i] = NAN;
                 continue;
             }
             const Stat s = stat_of(acc_[i]);
@@ -533,7 +541,6 @@ private:
                          "  ch%d: 중앙값 %.2f mbar 가 [%.0f, %.0f] 밖 -> 거부 (물속에서 잡으려는 것 아닙니까?)\n",
                          i, s.med, atm_min_mbar_, atm_max_mbar_);
                 report += buf;
-                atm_offset_[i] = NAN;
                 continue;
             }
             if (spread > atm_spread_max_) {
@@ -541,10 +548,9 @@ private:
                          "  ch%d: 산포 %.3f mbar (한계 %.2f) -> 거부 (로봇이 흔들리거나 물에 떠 있습니다)\n",
                          i, spread, atm_spread_max_);
                 report += buf;
-                atm_offset_[i] = NAN;
                 continue;
             }
-            atm_offset_[i] = s.med;
+            new_off[i] = s.med;
             ok_count++;
             snprintf(buf, sizeof(buf), "  ch%d: %.4f mbar  (산포 %.3f, 유효 %zu샘플)\n",
                      i, s.med, spread, acc_[i].size());
@@ -581,6 +587,17 @@ private:
                 RCLCPP_ERROR(this->get_logger(), "[Hydro] 대기압 영점 포착 실패 — 다시 시도합니다\n%s", report.c_str());
             }
             return;
+        }
+
+        // **성공한 채널만 덮어쓴다.** 실패한 채널은 들고 있던 값을 그대로 쓴다 —
+        // 잡은 시각이 달라 조금 어긋날 뿐이고, NaN 으로 만드는 것보다 훨씬 낫다.
+        for (int i = 0; i < 3; i++) {
+            if (std::isfinite(new_off[i]))      atm_offset_[i] = new_off[i];
+            else if (std::isfinite(atm_offset_[i])) {
+                char buf[120];
+                snprintf(buf, sizeof(buf), "  ch%d: 기존 영점 %.4f mbar 유지\n", i, atm_offset_[i]);
+                report += buf;
+            }
         }
 
         const bool was_provisional = atm_provisional_;
@@ -769,7 +786,8 @@ private:
         float static_gauge = nan_f, depth = nan_f;
         if (n > 0) {
             static_gauge = (float)(sum / n);
-            last_static_gauge_ = static_gauge;
+            last_static_gauge_      = static_gauge;
+            last_static_gauge_time_ = this->now();
             depth        = (float)(sum / n / mbar_per_m_);
             flags |= FLAG_DEPTH_OK;
             // 하나만 살아남으면 좌우 평균의 롤 상쇄가 깨진다 — 수심이 자세
@@ -1031,38 +1049,45 @@ private:
         res->message = "수집 시작 — 결과는 저널에 남습니다. 꼬리를 멈추고 흐름이 없게 하십시오.";
     }
 
-    // btn1 롱프레스 = "지금 상황에 맞는 영점을 잡아라".
+    // btn1 롱프레스 = 대기압 영점 재포착 (+ 공기 Δb 로 q 영점 자동 충전).
     //
-    // 공기와 물속은 요구가 반대라 하나의 동작으로 묶을 수 없다. 그래서 잠김 여부로
-    // 가른다. 판정 문턱을 둘로 두고 **애매한 구간은 추측하지 않고 거부**한다:
-    //   < 5 mbar   공기  — 하루 지난 영점의 최악 표류 3.4 mbar(3.87일 실측)보다 여유
-    //   > 15 mbar  물속  — 기울기 시험이 어차피 40 cm 를 요구하니 15 cm 미만은 쓸 일이 없다
-    //   그 사이     거부  — 틀린 쪽을 고르면 영점이 통째로 오염된다
+    // **공기 중 전용이다.** 물속 q 영점은 여기 붙이지 않는다 — 욕조 시험에서 오차가
+    // 실제로 보였을 때만 쓰는 선택 사항이라(docs/todo.md 4장) 버튼에 얹어 두면
+    // 잘못 눌렀을 때 쓸모없는 실패 로그만 쌓인다. 필요하면 /hydro/zero_q 를 부른다.
+    //
+    // 잠김 확인만 남긴다. **이건 지우면 안 된다** — 얕게 잠긴 채 누르면 그 깊이가
+    // [900,1100] 타당성 게이트를 **통과해** 대기압으로 박히고, 그 세션 내내 수심이
+    // 그만큼 어긋난 채 아무 표시도 없다. 조용히 틀리느니 시끄럽게 거부하는 편이 낫다.
+    // (실측: 8 mbar 에서 통과시켰더니 8 cm 가 그대로 영점에 들어갔다.)
+    //
+    // 문턱 5 mbar 근거는 **공기 중 게이지압이 얼마나 커질 수 있느냐**다. 기압 표류
+    // 실측이 하루 최악 3.4 mbar 이고, atm_zero_max_age_sec(기본 하루)가 그보다 묵은
+    // 영점은 아예 적재하지 않으므로 **공기 중에서 3.4 mbar 를 넘을 수 없다.** 5 는
+    // 그 위, 그리고 수면에 떠 있을 때의 잠김(5 cm 이상)보다는 아래다.
+    // 정말 공기 중인데 거부당하면 /hydro/zero_atm 으로 우회한다.
     void btn1_long_press() {
-        const bool have_static = std::isfinite(last_static_gauge_);
-        if (!atm_captured_ || !have_static) {
-            // 대기압 영점이 아예 없으면 게이지압을 못 구한다. 그 상태는 사실상 첫 기동이고
-            // 공기 중일 수밖에 없으므로 공기 경로로 간다.
-            start_recapture("버튼1 롱프레스");
-            return;
+        // 영점이 아예 없으면 게이지압을 구할 수 없다. 그 상태는 사실상 첫 기동이라
+        // 공기 중일 수밖에 없으므로 판정 없이 진행한다.
+        if (atm_captured_) {
+            // **신선도를 확인한다.** last_static_gauge_ 는 마지막으로 유효했던 값이라
+            // 압력이 끊기거나 재포착이 진행 중이면 몇 초 묵은 값일 수 있다. 그걸로
+            // 판정하면 잠긴 상태를 공기로 오독한다(실측: 8 mbar 값을 들고 29 mbar 를 판정).
+            const double age = (this->now() - last_static_gauge_time_).seconds();
+            if (!std::isfinite(last_static_gauge_) || age > press_timeout_) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "[Hydro] 정압을 읽지 못해 공기인지 물속인지 판정할 수 없습니다 — 대기압 영점을 잡지 않습니다. "
+                    "압력 스트림과 정압 포트를 확인하십시오.");
+                return;
+            }
+            if (last_static_gauge_ > btn1_max_gauge_mbar_) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "[Hydro] 물속으로 보입니다 (게이지압 %.2f mbar, 약 %.0f cm) — 대기압 영점을 잡지 않습니다. "
+                    "물 밖으로 꺼낸 뒤 다시 누르십시오. (정말 공기 중이면 /hydro/zero_atm 으로 강제)",
+                    last_static_gauge_, last_static_gauge_ / mbar_per_m_ * 100.0);
+                return;
+            }
         }
-        const double g = last_static_gauge_;
-        if (g < 5.0) {
-            RCLCPP_INFO(this->get_logger(), "[Hydro] 공기 중으로 판정 (게이지압 %.2f mbar) -> 대기압 영점 + 공기 Δb", g);
-            start_recapture("버튼1 롱프레스");
-        } else if (g > 15.0) {
-            RCLCPP_INFO(this->get_logger(), "[Hydro] 잠김으로 판정 (게이지압 %.2f mbar, 약 %.0f cm) -> 물속 q 영점",
-                        g, g / mbar_per_m_ * 100.0);
-            auto req = std::make_shared<std_srvs::srv::Trigger::Request>();
-            auto res = std::make_shared<std_srvs::srv::Trigger::Response>();
-            handle_zero_q(req, res);
-            if (!res->success)
-                RCLCPP_ERROR(this->get_logger(), "[Hydro] 물속 q 영점 거부: %s", res->message.c_str());
-        } else {
-            RCLCPP_ERROR(this->get_logger(),
-                "[Hydro] 공기인지 물속인지 판정할 수 없습니다 (게이지압 %.2f mbar). "
-                "물 밖으로 꺼내거나 15 cm 이상 잠기게 한 뒤 다시 누르십시오.", g);
-        }
+        start_recapture("버튼1 롱프레스");
     }
 
     void collect_q_zero(float q_raw, float dph, float static_gauge) {
@@ -1171,6 +1196,8 @@ private:
     int           q_neg_run_         = 0;
     float         last_pitch_used_   = 0.0f, last_dph_ = 0.0f;
     float         last_static_gauge_ = std::numeric_limits<float>::quiet_NaN();
+    double        btn1_max_gauge_mbar_ =  5.0;   // 이 이상 잠기면 btn1 대기압 영점 거부 (약 5 cm)
+    rclcpp::Time  last_static_gauge_time_;       // 위 값의 나이 — 낡은 값으로 판정하면 안 된다
     rclcpp::Time q_collect_start_;
     rclcpp::Time node_start_time_, last_press_time_;
 

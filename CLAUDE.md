@@ -150,7 +150,10 @@ clamp events, because its fixed `Kp·dt` correction step must stay bounded. §1.
   sensors **that transient is absent** — slopes sit inside the estimator's own noise floor from
   t=30 s, and 180 s vs 300 s changes the resulting depth error by 0.03–0.17 mm, below sensor noise.
   Re-verify after final assembly (`press_char.py --s1`); a sealed housing may bring the transient back.
-  Re-zero any time with a btn1 long press.
+  Re-zero any time with a btn1 long press (**in air** — the node refuses above 5 mbar gauge, because a
+  shallow submersion passes the `[900,1100]` plausibility gate and would silently bake that depth into
+  the zero). **A refused or failed re-capture never destroys the zero in use** — new per-channel offsets
+  are staged and only committed on success, so depth never drops out mid-dive.
 
 ### 7. Hardware quirks
 
@@ -220,7 +223,7 @@ Short press = 30 ms–1 s; long press = exactly 3 s (`== 300`, fires once).
 
 | | Short | Long |
 |---|---|---|
-| btn1 | AUTO/MANUAL toggle | re-zero atmospheric pressure (**handled by `hydro_estimator_node`** since 2026-08-21; the EKF still detects the 3 s hold, but only to suppress the release from counting as a short press) |
+| btn1 | AUTO/MANUAL toggle | re-zero atmospheric pressure, **in air only** — refused above 5 mbar gauge (**handled by `hydro_estimator_node`** since 2026-08-21; the EKF still detects the 3 s hold, but only to suppress the release from counting as a short press). The in-water q zero is deliberately *not* on this button; call `/hydro/zero_q` for it |
 | btn2 | set current heading as yaw 0 | run `magneto_cal.py` (ellipsoid); long-press again = finish collection early (SIGINT) |
 
 When the RC link drops the nRF sends `btn = 255`; both `state_estimation_ekf_node` and
