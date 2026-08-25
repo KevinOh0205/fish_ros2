@@ -151,6 +151,7 @@ public:
         node_start_time_ = this->now();
         last_press_time_ = this->now();
         last_att_time_   = this->now() - rclcpp::Duration::from_seconds(3600.0);   // "아직 없음"
+        q_collect_start_ = this->now();
 
         for (int i = 0; i < 3; i++) atm_offset_[i] = NAN;
 
@@ -269,7 +270,6 @@ private:
         lever_x_    = this->declare_parameter<double>("lever_x_m", 0.176);
         lever_y_    = this->declare_parameter<double>("lever_y_m", 0.0);
         lever_z_    = this->declare_parameter<double>("lever_z_m", 0.0);
-        half_span_  = this->declare_parameter<double>("port_half_span_m", 0.044);  // 좌우 8.8cm 의 절반
 
         // k = 1/sqrt(Cp_front − Cp_static). 옆구리 플러시 포트는 동체 주위 가속 때문에
         // 자유류 정압보다 낮게 읽으므로(Cp<0) 차압이 부풀려진다. k 가 그걸 흡수한다.
@@ -295,6 +295,8 @@ private:
         q_window_    = this->declare_parameter<int>("q_zero_window_samples", 33); // ~3초 @11Hz
         q_spread_max_= this->declare_parameter<double>("q_zero_spread_max_mbar", 0.5);
         min_submerged_ = this->declare_parameter<double>("min_submerged_mbar", 3.0);
+        // 33샘플이 11Hz 면 3초. 30초를 주면 절반이 유실돼도 끝난다.
+        q_collect_timeout_ = this->declare_parameter<double>("q_zero_timeout_sec", 30.0);
 
         K_ = rho_ * gravity_ / 100.0;
 
@@ -326,8 +328,8 @@ private:
         RCLCPP_INFO(this->get_logger(), "[Hydro] 물속 q 영점: 서비스 /hydro/zero_q  (%s)",
                     q_zero_captured_ ? "확보됨" : "**미확보 — 속도는 상대값**");
         RCLCPP_INFO(this->get_logger(),
-                    "[Hydro]   기하: lever=(%.3f, %.3f, %.3f) m, 좌우반경 %.3f m, k=%.3f, 지연 %.0f ms",
-                    lever_x_, lever_y_, lever_z_, half_span_, speed_k_, pressure_lag_ms_);
+                    "[Hydro]   기하: lever=(%.3f, %.3f, %.3f) m, k=%.3f, 지연 %.0f ms",
+                    lever_x_, lever_y_, lever_z_, speed_k_, pressure_lag_ms_);
         if (std::abs(speed_k_ - 1.0) < 1e-9)
             RCLCPP_WARN(this->get_logger(),
                 "[Hydro] ※ speed_k=1.0 — **속도가 보정되지 않았습니다.** 자력 주행 실측으로 맞출 것 "
@@ -695,13 +697,10 @@ private:
             flags |= FLAG_DEPTH_OK;
             // 하나만 살아남으면 좌우 평균의 롤 상쇄가 깨진다 — 수심이 자세
             // 의존이 되므로 알려야 한다. 반경 0.06 m, 롤 30도에서 약 3 cm.
-            if (n == 1 && !warned_single_) {
-                warned_single_ = true;
-                RCLCPP_WARN(this->get_logger(),
+            if (n == 1) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
                             "[Hydro] 정압 포트가 하나뿐입니다 — 롤 상쇄가 깨져 수심이 자세에 의존합니다 "
                             "(롤 30도에서 약 3 cm).");
-            } else if (n == 2) {
-                warned_single_ = false;
             }
         }
 
@@ -712,11 +711,26 @@ private:
         //  차압의 바닥은 0.053 mbar 였다 — 100배 이상 공통모드 상쇄.)
         float q_raw = nan_f, dph = nan_f, pitch_used = nan_f, q_out = nan_f, speed = nan_f;
 
+        // **정압 포트는 둘 다 살아 있어야 한다.** 하나만 쓰면 유효 측정점이 롤 축(중점)에서
+        // 4.4 cm 벗어나 롤 30도에서 2.13 mbar 가 누락되고, v=0.6 이 0.887 로 읽힌다(+48%).
+        // 실효 lever_y 를 넣어 보정할 수도 있지만 그러지 않는다 — 정압 포트가 죽는 것은
+        // 복구 가능한 운용 상태가 아니라 **분해가 필요한 하드웨어 고장**이다. 어중간하게
+        // 보정한 값을 내면 고장을 안고 계속 주행하게 만든다.
+        // 수심은 다르다: 한쪽만으로도 (자세 의존이지만) 계속 내야 로봇을 회수할 수 있다.
         const bool have_front = alive[ch_front_];
         int ns = 0; double ssum = 0.0;
         for (int ch : {ch_left_, ch_right_}) { if (alive[ch]) { ssum += p[ch]; ns++; } }
 
-        if (have_front && ns > 0) {
+        if (have_front && ns == 1) {
+            // 래치만으로는 부족하다 — 간헐 고장이면 ns 가 1과 2를 오가며 래치가 계속
+            // 풀려 매 샘플 찍힌다(11Hz). 스로틀을 함께 건다.
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+                "[Hydro] 정압 포트가 하나뿐이라 **속도를 내지 않습니다**(NaN). 롤 상쇄가 깨져 "
+                "롤 30도에서 2.1 mbar 가 누락되기 때문입니다. 수심은 계속 나옵니다. "
+                "분해해서 포트를 고치십시오.");
+        }
+
+        if (have_front && ns == 2) {
             q_raw = (float)((double)p[ch_front_] - ssum / ns);
 
             // 자세를 **압력이 대표하는 과거 시각**에서 꺼낸다.
@@ -812,6 +826,17 @@ private:
     }
 
     void watchdog() {
+        // q 수집 타임아웃. collect_q_zero() 는 압력 콜백 안에서만 도므로, 압력이 끊기면
+        // 거기서는 영원히 판정이 안 된다. 그래서 타이머 쪽에서 본다.
+        if (q_zero_collecting_ && (this->now() - q_collect_start_).seconds() > q_collect_timeout_) {
+            RCLCPP_ERROR(this->get_logger(),
+                "[Hydro] q 영점 수집 시간 초과 (%.0f초, %zu/%d샘플) — 취소합니다. "
+                "압력 스트림이 끊겼거나 채널이 죽었습니다.",
+                q_collect_timeout_, q_acc_.size(), q_window_);
+            q_zero_collecting_ = false;
+            q_acc_.clear();
+        }
+
         // 첫 수신 전에는 판정하지 않는다. DDS 발견에 0.5초 넘게 걸리는 일이 흔해서,
         // 그냥 두면 기동할 때마다 "압력 스트림 정지" 오류가 헛발동한다.
         // 대신 한 번도 못 받는 경우는 따로 알린다 — 조용히 죽어 있으면 안 되므로.
@@ -878,6 +903,7 @@ private:
         }
         q_acc_.clear();
         q_zero_collecting_ = true;
+        q_collect_start_   = this->now();
         RCLCPP_WARN(this->get_logger(),
             "[Hydro] 물속 q 영점 수집 시작 (%d샘플 약 %.0f초) — 로봇을 물속에 정지시켜 두십시오.",
             q_window_, q_window_ / 11.0);
@@ -947,9 +973,10 @@ private:
 
     // ---- 파라미터 ----
     double rho_, gravity_, mbar_per_m_, K_;
-    double lever_x_, lever_y_, lever_z_, half_span_, speed_k_;
+    double lever_x_, lever_y_, lever_z_, speed_k_;
     double pressure_lag_ms_, att_timeout_ms_, mount_pitch_deg_;
     double q_lpf_tau_, q_sigma_, q_deadband_n_, q_offset_max_, q_spread_max_, min_submerged_;
+    double q_collect_timeout_;
     int    q_window_;
     double warmup_sec_, atm_spread_max_, atm_min_mbar_, atm_max_mbar_;
     double atm_zero_max_age_, q_zero_max_age_, press_timeout_;
@@ -986,7 +1013,7 @@ private:
     bool          q_lpf_seeded_      = false;
     int           q_neg_run_         = 0;
     float         last_pitch_used_   = 0.0f, last_dph_ = 0.0f;
-    bool   warned_single_  = false;
+    rclcpp::Time q_collect_start_;
     rclcpp::Time node_start_time_, last_press_time_;
 
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pressure_sub_;
