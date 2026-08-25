@@ -205,7 +205,9 @@ clamp events, because its fixed `Kp·dt` correction step must stay bounded. §1.
   Recalibrated assembled 2026-08-17: scatter 6.1 %, dip 137.2°, 360° spin ratio 1.00; hard iron
   changed completely, (−12.3, +23.5, −89.8) → (+9.9, +61.6, −16.1) µT (§9). Tumble in one spot,
   ≥1 m from steel; **never calibrate from a flat spin** (it cannot see the vertical offset). File:
-  `~/ros2_ws/log_csv/mag_calib_params.txt` (`mag_calib.txt` at the workspace root is read by nothing).
+  `~/ros2_ws/log_csv/mag_calib_params.txt`. (A stale `mag_calib.txt` sat at the workspace root,
+  read by nothing — deleted 2026-08-25. It held June-9 **min/max** values, the method retired for
+  measuring *worse than no calibration*, so it looked restorable but would have made things worse.)
 - **A bad mag vector corrupted Mahony's roll/pitch** (5.0°/1.7° measured), not just yaw; the EKF's
   1-D horizontal yaw update is structurally immune (§5.1, §5.2).
 - **A hand-held spin cannot validate heading better than ~3°** — the residual sine is the ROOM
