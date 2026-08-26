@@ -49,6 +49,15 @@ public:
                        kp_p_(8.75f), ki_p_(0.0f), kd_p_(0.0f),
                        kp_y_(1.2f), ki_y_(0.0f), kd_y_(0.0f),
                        i_limit_(300.0f),                       // 적분 와인드업 상한 (ki=0인 지금은 무효)
+                       // 서보 방향: 우측 지느러미는 몸 반대편에 **거울상으로 장착**돼
+                       // 같은 PWM 증가가 물리적으로 반대 회전이 된다. 실측(2026-08-26):
+                       // 피치 명령에 좌우가 반대로 돌고(=물리 롤), 롤 명령에 같이 돌았다
+                       // (=물리 피치) — 명령의 자세↔서보 상관은 정상(−0.93/−0.96)이었으므로
+                       // 원인은 믹싱이 아니라 장착 방향. 우측 편향만 반전한다.
+                       servo_rev_l_(false), servo_rev_r_(true), servo_rev_y_(false),
+                       // 스틱 데드밴드: 실측(45초 정지)에서 roll 스틱이 중립인데 −12까지
+                       // 방황했고(트림 오프셋+잡음), 스로틀이 0→28 스파이크를 냈다.
+                       rc_deadband_(15), throttle_deadband_(40),
                        err_sum_roll_(0.0f), err_sum_pitch_(0.0f), err_sum_yaw_(0.0f),
                        prev_err_roll_(0.0f), prev_err_pitch_(0.0f), prev_err_yaw_(0.0f),
                        robot_roll_(0.0f), robot_pitch_(0.0f), robot_yaw_(0.0f),
@@ -75,6 +84,11 @@ public:
         ki_y_ = (float)this->declare_parameter<double>("ki_yaw",   (double)ki_y_);
         kd_y_ = (float)this->declare_parameter<double>("kd_yaw",   (double)kd_y_);
         i_limit_ = (float)this->declare_parameter<double>("i_limit", (double)i_limit_);
+        servo_rev_l_ = this->declare_parameter<bool>("servo_reverse_left",  servo_rev_l_);
+        servo_rev_r_ = this->declare_parameter<bool>("servo_reverse_right", servo_rev_r_);
+        servo_rev_y_ = this->declare_parameter<bool>("servo_reverse_yaw",   servo_rev_y_);
+        rc_deadband_       = (int)this->declare_parameter<int64_t>("rc_deadband",       rc_deadband_);
+        throttle_deadband_ = (int)this->declare_parameter<int64_t>("throttle_deadband", throttle_deadband_);
 
         // 런타임 변경 반영. 변경은 WARN 으로 남긴다 — 물속 튜닝에서 "몇 시에 어떤
         // 게인이었나"가 저널에 남아야 CSV 와 대조할 수 있다.
@@ -84,6 +98,9 @@ public:
         RCLCPP_INFO(this->get_logger(),
             "=== [PID Control] 게인: roll %.2f/%.2f/%.2f  pitch %.2f/%.2f/%.2f  yaw %.2f/%.2f/%.2f (kp/ki/kd) ===",
             kp_r_, ki_r_, kd_r_, kp_p_, ki_p_, kd_p_, kp_y_, ki_y_, kd_y_);
+        RCLCPP_INFO(this->get_logger(),
+            "=== [PID Control] 서보 반전: 좌 %d / 우 %d / 요 %d  스틱 데드밴드: rpy %d, 스로틀 %d ===",
+            servo_rev_l_, servo_rev_r_, servo_rev_y_, rc_deadband_, throttle_deadband_);
         RCLCPP_INFO(this->get_logger(),
             "=== [PID Control] 런타임 튜닝: ros2 param set /pid_control_node kp_pitch <값> ===");
 
@@ -158,6 +175,11 @@ private:
     on_param_change(const std::vector<rclcpp::Parameter> &params) {
         for (const auto &prm : params) {
             const std::string &n = prm.get_name();
+            if (n == "servo_reverse_left")  { servo_rev_l_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 서보 반전 변경: 좌 = %d", servo_rev_l_); continue; }
+            if (n == "servo_reverse_right") { servo_rev_r_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 서보 반전 변경: 우 = %d", servo_rev_r_); continue; }
+            if (n == "servo_reverse_yaw")   { servo_rev_y_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 서보 반전 변경: 요 = %d", servo_rev_y_); continue; }
+            if (n == "rc_deadband")       { rc_deadband_       = (int)prm.as_int(); RCLCPP_WARN(this->get_logger(), "[PID Control] rc_deadband = %d", rc_deadband_); continue; }
+            if (n == "throttle_deadband") { throttle_deadband_ = (int)prm.as_int(); RCLCPP_WARN(this->get_logger(), "[PID Control] throttle_deadband = %d", throttle_deadband_); continue; }
             const float v = (float)prm.as_double();
             if      (n == "kp_roll")  kp_r_ = v;
             else if (n == "ki_roll")  { ki_r_ = v; err_sum_roll_  = 0.0f; }
@@ -227,11 +249,25 @@ private:
             target_yaw = auto_yaw_ * 0.1f;
             active_throttle = constrain_pwm(auto_throttle_);   // 시나리오는 이미 PWM 단위로 준다
         } else {
-            target_roll = rc_roll_ * 0.1f;
-            target_pitch = rc_pitch_ * 0.1f;
-            target_yaw = rc_yaw_ * 0.1f;
+            // 스틱 데드밴드 — **MANUAL 분기에만** 둔다. AUTO 경로(auto_*)에 새면 시나리오
+            // 명령이 깎이고, uart_bridge 에서 깎으면 data_logger 의 원시 스틱 기록이
+            // 사라져 오늘 같은 잡음 진단이 불가능해진다. 여기가 유일하게 옳은 자리다.
+            // roll/pitch/yaw 는 소프트(재중심): 경계 불연속 없이 중심 부근 미세 트림을
+            // 지킨다. 최대 목표각이 25.5°→24.0° 로 주는 것은 무시한다.
+            auto soft_db = [this](int16_t st) -> int16_t {
+                if (st >  rc_deadband_) return (int16_t)(st - rc_deadband_);
+                if (st < -rc_deadband_) return (int16_t)(st + rc_deadband_);
+                return 0;
+            };
+            target_roll  = soft_db(rc_roll_)  * 0.1f;
+            target_pitch = soft_db(rc_pitch_) * 0.1f;
+            target_yaw   = soft_db(rc_yaw_)   * 0.1f;
+            // 스로틀은 하드 데드밴드: "의도적 입력 전까지 ESC 는 정확히 1000" 이라는
+            // 안전 속성이 연속성보다 중요하다. −9999 센티넬은 위 페일세이프가 이미
+            // 걸렀으므로 여기 도달한 rc_throttle_ 은 실제 스틱 값이다.
+            int16_t thr = (rc_throttle_ < throttle_deadband_) ? 0 : rc_throttle_;
             // 조종기 스로틀 원시 범위(0~1171)를 ESC PWM 범위(1000~2000)로 선형 사상
-            int16_t mapped_throttle = static_cast<int16_t>(rc_throttle_ * (1000.0f / 1171.0f));
+            int16_t mapped_throttle = static_cast<int16_t>(thr * (1000.0f / 1171.0f));
             active_throttle = constrain_pwm(1000 + mapped_throttle);
         }
 
@@ -290,9 +326,19 @@ private:
         // 좌우 가슴지느러미 서보를 차동 구동한다:
         //   두 서보를 같은 방향으로 움직이면 -> 피치(상승/하강)
         //   서로 반대 방향으로 움직이면     -> 롤(좌우 기울기)
-        motor_output_msg.data[0] = constrain_servo(1500 + u_pitch + u_roll);   // 좌 서보
-        motor_output_msg.data[1] = constrain_servo(1500 + u_pitch - u_roll);   // 우 서보
-        motor_output_msg.data[2] = constrain_servo(1500 + u_yaw);              // 요(방향) 서보
+        // 채널별 편향을 만든 뒤 장착 방향에 맞춰 반전한다 (기본: 우측만 반전 —
+        // 거울상 장착). 반전 후에는 피치 = 두 지느러미가 물리적으로 같은 방향,
+        // 롤 = 서로 반대 방향이 된다. 벤치에서 방향이 반대로 보이면 재빌드 없이
+        // ros2 param set /pid_control_node servo_reverse_* 로 뒤집어 확인한다.
+        float d_left  = u_pitch + u_roll;
+        float d_right = u_pitch - u_roll;
+        float d_yaw_s = u_yaw;
+        if (servo_rev_l_) d_left  = -d_left;
+        if (servo_rev_r_) d_right = -d_right;
+        if (servo_rev_y_) d_yaw_s = -d_yaw_s;
+        motor_output_msg.data[0] = constrain_servo(1500 + d_left);    // 좌 서보
+        motor_output_msg.data[1] = constrain_servo(1500 + d_right);   // 우 서보
+        motor_output_msg.data[2] = constrain_servo(1500 + d_yaw_s);   // 요(방향) 서보
         motor_output_msg.data[3] = active_throttle;                            // 꼬리 BLDC 추진
 
         if (is_auto_mode_) {
@@ -309,6 +355,8 @@ private:
     float kp_p_, ki_p_, kd_p_;
     float kp_y_, ki_y_, kd_y_;
     float i_limit_;                                          // 적분 누산 한계 (안티 와인드업)
+    bool servo_rev_l_, servo_rev_r_, servo_rev_y_;           // 채널별 장착 방향 반전
+    int  rc_deadband_, throttle_deadband_;                   // 스틱 데드밴드 [카운트]
     float err_sum_roll_, err_sum_pitch_, err_sum_yaw_;       // I항 누산 상태
     float prev_err_roll_, prev_err_pitch_, prev_err_yaw_;    // D항 계산용 직전 오차
     float robot_roll_, robot_pitch_, robot_yaw_;             // 현재 자세(측정값)
