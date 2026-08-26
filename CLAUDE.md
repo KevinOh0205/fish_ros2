@@ -124,7 +124,7 @@ transmitter is the normal case.
 `pid_control_node` has **no timer** — PID runs inside `attitude_callback`, and it **omits `dt`**
 (gains absorb it, assuming a fixed 100 Hz). `/filtered/attitude` must only ever have ONE publisher
 (ghost-publisher check below) — but be precise about *why*, because the obvious reason is currently
-false: **`ki` and `kd` are all `0.0f`** (`pid_control_node.cpp:39-41`), so P-only control is
+false: **`ki` and `kd` are all `0.0f`** (`pid_control_node.cpp`), so P-only control is
 rate-independent and doubling the attitude rate does **not** change the servo command. The real
 damage from two publishers is (1) two different estimators' attitudes arriving alternately, so the
 output chatters between two values, and (2) `/motor/output` doubling to 200 Hz, which doubles the
@@ -189,8 +189,10 @@ clamp events, because its fixed `Kp·dt` correction step must stay bounded. §1.
   bandwidth and costs 0.86 s of lag (25 cm at 0.3 m/s descent).
 - A dead pressure channel is marked by `prom_C_[i][1] == 0` and reported downstream as `0.0`; the
   estimator treats `< 100 mbar` as invalid.
-- `SERVO_MIN_US`/`SERVO_MAX_US` (1250/1750) in `pid_control_node.cpp` **must match the nRF firmware's
-  `MotorControl.cpp`**. This repo cannot enforce that.
+- `SERVO_MIN_US`/`SERVO_MAX_US` (1325/1675 since 2026-08-26 — horn ≈ ±20° on the HS-5086WP's
+  0.114°/µs) in `pid_control_node.cpp` **must stay inside the nRF firmware's `MotorControl.cpp`
+  window (1250/1750)** — narrower here is safe (the nRF clamp never triggers); wider is not.
+  This repo cannot enforce that.
 
 ### 8. Magnetometer: fallback, axes, calibration
 

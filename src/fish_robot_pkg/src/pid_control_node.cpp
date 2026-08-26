@@ -27,17 +27,25 @@
 #include <vector>
 #include <cmath>
 
-// 서보 동작 범위 (중립 1500us 기준 ±30°). nRF 펌웨어 MotorControl.cpp의
-// SERVO_MIN_US/SERVO_MAX_US와 반드시 동일하게 유지할 것 (N5: 범위 불일치 방지).
-#define SERVO_MIN_US 1250
-#define SERVO_MAX_US 1750
+// 서보 동작 범위: 혼 기준 약 ±20° (2026-08-26 확정).
+//   서보는 HS-5086WP — 표준 RC 신호 ±400us 에 총 91° 를 도는 기종이라
+//   0.114°/us 이고, ±20° 는 ±175us, 즉 1325~1675 다.
+// nRF 펌웨어 MotorControl.cpp 는 1250~1750 으로 더 넓다. 규칙은 "동일"이 아니라
+// **"여기 창이 nRF 창 안에 포함될 것"** 이다 — 여기가 더 좁으면 nRF 클램프에는
+// 절대 걸리지 않으므로 안전하고, 여기를 nRF 보다 넓히는 것만 금지다 (N5).
+#define SERVO_MIN_US 1325
+#define SERVO_MAX_US 1675
 
 class PidControlNode : public rclcpp::Node {
 public:
     PidControlNode() : Node("pid_control_node"),
                        // PID 게인: 현재 P만 사용 중 (I/D는 0으로 비활성)
-                       kp_r_(3.5f), ki_r_(0.0f), kd_r_(0.0f),
-                       kp_p_(3.5f), ki_p_(0.0f), kd_p_(0.0f), // 회원님 제안대로 지상 테스트를 위해 0.0 유지
+                       // kp 8.75 = 175us / 20°: 오차 1° 당 혼이 약 1° 꺾이고(0.114°/us
+                       // 역수), 오차 20° 에서 창 끝(±175us)에 닿는다. 이전 3.5 는
+                       // 포화에 오차 71° 가 필요해 벤치에서 "찔끔" 움직였다.
+                       // ※ 벤치용 정적 배율이다 — 물에서 출렁이면 낮추는 게 §5 튜닝.
+                       kp_r_(8.75f), ki_r_(0.0f), kd_r_(0.0f),
+                       kp_p_(8.75f), ki_p_(0.0f), kd_p_(0.0f),
                        kp_y_(1.2f), ki_y_(0.0f), kd_y_(0.0f),
                        i_limit_(300.0f),                       // 적분 와인드업 상한 (ki=0인 지금은 무효)
                        err_sum_roll_(0.0f), err_sum_pitch_(0.0f), err_sum_yaw_(0.0f),

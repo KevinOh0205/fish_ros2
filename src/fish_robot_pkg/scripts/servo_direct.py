@@ -18,7 +18,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Quaternion
 from std_msgs.msg import UInt16MultiArray
 
-SERVO_MIN, SERVO_MAX, SERVO_MID = 1250, 1750, 1500
+SERVO_MIN, SERVO_MAX, SERVO_MID = 1325, 1675, 1500   # 혼 약 ±20° (HS-5086WP 0.114°/us) — pid_control_node 와 동일
 
 # 스틱 원시 최대값. 예전 동작하던 Motor_Control.c 의 나눗셈 상수에서 역산했다
 # (roll/pitch 를 30/255, yaw 를 30/85 로 나눴다). 실측과 다르면 인자로 바꿀 것.
