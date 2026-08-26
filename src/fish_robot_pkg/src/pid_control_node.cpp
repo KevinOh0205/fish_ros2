@@ -16,6 +16,7 @@
 // =============================================================================
 
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <std_msgs/msg/int32.hpp>
@@ -60,7 +61,31 @@ public:
                        failsafe_timeout_(5.0),                 // 조종기 무수신 허용 시간(초)
                        last_valid_rc_time_(this->now())
     {
-        RCLCPP_INFO(this->get_logger(), "=== [PID Control] I_gain 0 세팅 및 자율 주행 연동 완료 ===");
+        // ── 게인을 ROS 파라미터로 노출 ─────────────────────────────────
+        // 물속 튜닝 때 빌드+재시작(약 1분) 없이 즉시 바꾸기 위해서다:
+        //   ros2 param set /pid_control_node kp_pitch 10.0
+        // 기본값은 위 초기화 목록의 값을 그대로 쓴다 — 진실원은 한 곳이다.
+        kp_r_ = (float)this->declare_parameter<double>("kp_roll",  (double)kp_r_);
+        ki_r_ = (float)this->declare_parameter<double>("ki_roll",  (double)ki_r_);
+        kd_r_ = (float)this->declare_parameter<double>("kd_roll",  (double)kd_r_);
+        kp_p_ = (float)this->declare_parameter<double>("kp_pitch", (double)kp_p_);
+        ki_p_ = (float)this->declare_parameter<double>("ki_pitch", (double)ki_p_);
+        kd_p_ = (float)this->declare_parameter<double>("kd_pitch", (double)kd_p_);
+        kp_y_ = (float)this->declare_parameter<double>("kp_yaw",   (double)kp_y_);
+        ki_y_ = (float)this->declare_parameter<double>("ki_yaw",   (double)ki_y_);
+        kd_y_ = (float)this->declare_parameter<double>("kd_yaw",   (double)kd_y_);
+        i_limit_ = (float)this->declare_parameter<double>("i_limit", (double)i_limit_);
+
+        // 런타임 변경 반영. 변경은 WARN 으로 남긴다 — 물속 튜닝에서 "몇 시에 어떤
+        // 게인이었나"가 저널에 남아야 CSV 와 대조할 수 있다.
+        param_cb_ = this->add_on_set_parameters_callback(
+            std::bind(&PidControlNode::on_param_change, this, std::placeholders::_1));
+
+        RCLCPP_INFO(this->get_logger(),
+            "=== [PID Control] 게인: roll %.2f/%.2f/%.2f  pitch %.2f/%.2f/%.2f  yaw %.2f/%.2f/%.2f (kp/ki/kd) ===",
+            kp_r_, ki_r_, kd_r_, kp_p_, ki_p_, kd_p_, kp_y_, ki_y_, kd_y_);
+        RCLCPP_INFO(this->get_logger(),
+            "=== [PID Control] 런타임 튜닝: ros2 param set /pid_control_node kp_pitch <값> ===");
 
         motor_pub_ = this->create_publisher<std_msgs::msg::UInt16MultiArray>("/motor/output", 10);
 
@@ -123,6 +148,33 @@ private:
     // 꼬리 BLDC RPM 수신 (추후 surge speed 제어에서 사용 예정)
     void rpm_callback(const std_msgs::msg::Int32::SharedPtr msg) {
         current_rpm_ = msg->data;
+    }
+
+    // 런타임 게인 변경. ki 를 바꾸면 그 축의 적분 누산을 0으로 리셋한다 —
+    // 누산(err_sum_)은 ki=0 인 동안에도 계속 쌓여 ±i_limit 에 붙어 있으므로,
+    // 리셋 없이 ki 를 켜면 그 순간 i_limit×ki 만큼 출력이 점프한다.
+    // ※ dt 를 게인에 흡수한 구현이라(아래 주의 참조) I/D 게인은 100Hz 기준 값이다.
+    rcl_interfaces::msg::SetParametersResult
+    on_param_change(const std::vector<rclcpp::Parameter> &params) {
+        for (const auto &prm : params) {
+            const std::string &n = prm.get_name();
+            const float v = (float)prm.as_double();
+            if      (n == "kp_roll")  kp_r_ = v;
+            else if (n == "ki_roll")  { ki_r_ = v; err_sum_roll_  = 0.0f; }
+            else if (n == "kd_roll")  kd_r_ = v;
+            else if (n == "kp_pitch") kp_p_ = v;
+            else if (n == "ki_pitch") { ki_p_ = v; err_sum_pitch_ = 0.0f; }
+            else if (n == "kd_pitch") kd_p_ = v;
+            else if (n == "kp_yaw")   kp_y_ = v;
+            else if (n == "ki_yaw")   { ki_y_ = v; err_sum_yaw_   = 0.0f; }
+            else if (n == "kd_yaw")   kd_y_ = v;
+            else if (n == "i_limit")  i_limit_ = v;
+            else continue;
+            RCLCPP_WARN(this->get_logger(), "[PID Control] 게인 변경: %s = %.3f", n.c_str(), v);
+        }
+        rcl_interfaces::msg::SetParametersResult res;
+        res.successful = true;
+        return res;
     }
 
     // 서보 출력 클램프: 기구부가 물리적으로 낼 수 있는 각도 밖으로 나가지 않게 막는다.
@@ -276,6 +328,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::Quaternion>::SharedPtr rc_cmd_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Quaternion>::SharedPtr auto_cmd_sub_;
     rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr rpm_sub_;
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
 };
 
 int main(int argc, char **argv) {

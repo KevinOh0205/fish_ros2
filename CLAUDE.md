@@ -124,7 +124,9 @@ transmitter is the normal case.
 `pid_control_node` has **no timer** — PID runs inside `attitude_callback`, and it **omits `dt`**
 (gains absorb it, assuming a fixed 100 Hz). `/filtered/attitude` must only ever have ONE publisher
 (ghost-publisher check below) — but be precise about *why*, because the obvious reason is currently
-false: **`ki` and `kd` are all `0.0f`** (`pid_control_node.cpp`), so P-only control is
+false: **`ki` and `kd` all default to `0.0`** (since 2026-08-26 the nine gains are ROS parameters,
+live-settable via `ros2 param set /pid_control_node kp_pitch <v>`; changing a `ki` resets that
+axis's integral accumulator, because it accumulates even while `ki`=0), so P-only control is
 rate-independent and doubling the attitude rate does **not** change the servo command. The real
 damage from two publishers is (1) two different estimators' attitudes arriving alternately, so the
 output chatters between two values, and (2) `/motor/output` doubling to 200 Hz, which doubles the
