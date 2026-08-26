@@ -252,7 +252,18 @@ def main():
             ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", td, str(f)],
             check=True, capture_output=True)
         pdf = Path(td) / (src.stem + ".pdf")
-        dst.write_bytes(pdf.read_bytes())
+
+        # libreoffice 는 한글(CFF 계열 Noto CJK)을 구형 Type 1 서브셋으로 임베드하는데,
+        # 이 형식을 못 읽는 뷰어가 많다 (GitHub 미리보기 등에서 글자가 깨진 실사례).
+        # ghostscript 로 재증류하면 Type 1C 로 바뀌어 어디서나 열리고 용량도 절반 이하다.
+        gs_out = Path(td) / (src.stem + "_gs.pdf")
+        r = subprocess.run(
+            ["gs", "-dNOPAUSE", "-dBATCH", "-dQUIET", "-sDEVICE=pdfwrite",
+             "-dCompatibilityLevel=1.7", "-dPDFSETTINGS=/prepress",
+             "-o", str(gs_out), str(pdf)], capture_output=True)
+        dst.write_bytes((gs_out if r.returncode == 0 else pdf).read_bytes())
+        if r.returncode != 0:
+            print("경고: ghostscript 재증류 실패 — libreoffice 원본을 그대로 씁니다")
     print(f"{dst}  ({dst.stat().st_size/1024:.0f} KB)")
 
 
