@@ -106,7 +106,7 @@ class Spin(Node):
 
         # ── 시작 정지 구간: 자이로 바이어스 측정 ──────────────────────────
         # 이 세션의 z 바이어스는 -2.2도/초라 빼지 않으면 30초에 66도가 샌다.
-        # (state_estimation_node도 부팅 때 같은 일을 한다)
+        # (state_estimation_ekf_node도 부팅 때 같은 일을 한다)
         if self.calibrating:
             self.gbuf.append(g)
             if el >= BIAS_SEC:

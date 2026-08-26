@@ -34,13 +34,6 @@ ament_target_dependencies(i2c_driver_node rclcpp std_msgs geometry_msgs sensor_m
 target_link_libraries(i2c_driver_node ${M_LIB})
 
 # =================================================================
-# 3. State Estimation Node
-# =================================================================
-add_executable(state_estimation_node src/state_estimation_node.cpp)
-ament_target_dependencies(state_estimation_node rclcpp std_msgs geometry_msgs sensor_msgs std_srvs)
-target_link_libraries(state_estimation_node ${M_LIB})
-
-# =================================================================
 # 4. PID Control Node
 # =================================================================
 add_executable(pid_control_node src/pid_control_node.cpp)
@@ -91,7 +84,6 @@ target_link_libraries(hydro_estimator_node ${M_LIB})
 install(TARGETS
   uart_bridge_node
   i2c_driver_node
-  state_estimation_node
   pid_control_node
   rpm_driver_node
   data_logger_node

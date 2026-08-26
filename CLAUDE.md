@@ -8,7 +8,7 @@ Full measurement history — every experiment, retraction, and trap — lives in
 ## What this is
 
 ROS2 Jazzy control software for an underwater fish robot, running on a Raspberry Pi 5 (Ubuntu Noble).
-Single package `fish_robot_pkg`, 7 C++ nodes, no custom messages. The Pi does sensor fusion, PID
+Single package `fish_robot_pkg`, 8 C++ nodes, no custom messages. The Pi does sensor fusion, PID
 control, and logging; an **nRF52840 MCU** (firmware lives outside this repo) owns the RC link, the
 IMU, and the servo/ESC PWM outputs.
 
@@ -70,7 +70,6 @@ I2C sensors ──▶ i2c_driver_node ──▶ /raw/magnetometer ──▶ stat
 | `uart_bridge_node` | `/dev/ttyAMA0` 115200 8N1. Byte-level packet state machine. **Pure pass-through — no scaling, no sign flips.** |
 | `i2c_driver_node` | `/dev/i2c-1`: AK8963 magnetometer (via MPU9250 bypass) + 3× MS5837 behind a TCA9548A mux |
 | `state_estimation_ekf_node` | MEKF filter, button UI, yaw offset, ±5000 mode encoding, mag calibration via `magneto_cal.py`. The "brain" — sole publisher of `/filtered/attitude`. **Pressure left this node on 2026-08-21** — it never entered the filter state; it was inherited furniture from the Mahony migration. |
-| `state_estimation_node` | **Retired 2026-08-17** — kept in the repo (still built) as the rollback path, removed from the launch. Mahony reference; never run it alongside the EKF node. |
 | `pid_control_node` | PID + motor mixing. Output `[0]=left servo, [1]=right servo, [2]=yaw servo, [3]=tail BLDC` |
 | `auto_scenario_node` | Time-based trajectory generator for AUTO mode |
 | `rpm_driver_node` | Hall-sensor pulse counting in a worker thread |
@@ -91,8 +90,8 @@ one place and you must change all four.
 ### 2. IMU units are **g** and **deg/s**, not REP-103
 
 `/raw/imu_6dof` is a `sensor_msgs/Imu`, but the nRF firmware sends **g** and **deg/s**, published
-unconverted (measured |a| ≈ 1.03 at rest, not 9.81; the estimators multiply the gyro by `M_PI/180`
-themselves — `state_estimation_node.cpp:523/525`). The filters normalize accel, so scale doesn't
+unconverted (measured |a| ≈ 1.03 at rest, not 9.81; the estimator multiplies the gyro by `M_PI/180`
+itself). The filters normalize accel, so scale doesn't
 matter to them, only direction. **Any new consumer of this topic must convert.**
 
 ### 3. Message types are reused as plain containers
@@ -134,8 +133,7 @@ UART packet rate to the nRF. The `dt`-omission gain problem becomes real **the m
 enabled** — which is exactly when someone will least expect it. Telling an operator "the gains are
 wrong" today sends them to re-tune gains that are fine.
 `state_estimation_ekf_node` measures `dt` per sample from `header.stamp` and integrates it with no
-upper clamp (covariance adjusts trust); the retired Mahony node clamps to `[0.001, 0.1]` s and logs
-clamp events, because its fixed `Kp·dt` correction step must stay bounded. §1.3.
+upper clamp (covariance adjusts trust). §1.3.
 
 ### 6. Startup is not instantaneous
 
@@ -279,7 +277,6 @@ It carries the water-vs-bench split, the "must be done before water" items, and 
 | **Positive pitch = nose DOWN** | opposite of aerospace convention (measured 2026-08-04). Confirm signs before touching the pitch PID or AUTO scenario. §2.1 |
 | Roll/pitch have no offset calibration | **Roll** shows a stable +6.4° over a 3.87-day bench record — that looks like a genuine mounting offset. **Pitch does not**: the "≈ 7.9°" from 2026-08-04 (§2.1) did not reproduce — the same 3.87 days averaged **−0.45°** (range −1.03 … +0.38) and another day read +5.83°. Resting pitch depends on how the robot is set down, so **do not treat 7.9° as a constant**. `hydro_estimator_node` used it as an attitude fallback until 2026-08-25; that fallback is gone (speed is NaN without attitude). |
 | Post-assembly tests pending | tail-beat pitch bias, PID sign bench check **before water**, multi-attitude tilt accuracy. §8.2 |
-| Retired Mahony node dead members | six write-only members left from an old button implementation. §5.1 |
 | `data_logger_node` total log volume unbounded | ~84 MB/hour since raw pressure columns (2026-08-21; ~80 MB since 2026-08-18). Per-file 200 MB rotation exists, but old files are never deleted (deliberate — `log_csv/` also holds the experiment CSVs; the calibration files now live in `config/`). Disk space is managed by hand. |
 
 ## Language
