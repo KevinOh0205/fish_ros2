@@ -63,11 +63,6 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "[I2C Driver] 100Hz 하드웨어 폴링 루프 작동 성공.");
 
-        // ##### [임시 2026-08-19 — 압력 특성화 측정용] #####
-        // 되돌리는 것을 잊지 않기 위한 경고. 이 줄이 저널에 보이면 아직 측정 설정이다.
-        RCLCPP_WARN(this->get_logger(),
-                    "[I2C Driver] ※ 압력 IIR 필터 비활성 (특성화 측정용). 운용 전 원복할 것.");
-        // ##### 임시 끝 #####
     }
 
     ~I2cDriverNode() {
@@ -346,8 +341,7 @@ private:
         static int state = 0;
         static int delay_counter = 0;
         static uint32_t D1[3] = {0}, D2[3] = {0};      // 채널별 원시 ADC (압력/온도)
-        static float filtered_P[3] = {0.0f};           // 채널별 저역통과 필터 상태
-        static bool first_read[3] = {true, true, true};
+        static float filtered_P[3] = {0.0f};           // 채널별 발행값 (필터 없음 — 아래 참조)
         uint8_t adc_buf[3];
 
         if (state == 0) {
@@ -465,34 +459,22 @@ private:
                                     i, raw_pressure);
                             }
 
-                            // 1차 IIR 저역통과 필터 (계수 0.1 = 시정수 약 0.8초 @11Hz).
-                            //
-                            // ※ 이 필터는 발행 전에 걸리므로 원본은 어디에도 남지 않는다.
-                            //   시정수 0.86초는 코너 주파수 0.19Hz로, 수심 제어를 붙이면
-                            //   루프 대역폭과 같은 영역이라 위상 여유를 깎을 수 있다.
-                            //   그때 계수를 재검토할 것 (잡음은 무필터에서도 0.20mbar =
-                            //   수심 2mm로 여유가 크다 — 맞바꿀 여지는 지연 쪽에 있다).
-                            //
-                            // 첫 샘플은 필터 상태를 그대로 세팅해 0에서 서서히 올라오는 것을 막는다.
-                            if (first_read[i]) {
-                                filtered_P[i] = raw_pressure;
-                                first_read[i] = false;
-                            } else {
-                                // ##### [임시 2026-08-19 — 압력 특성화 측정용] #####
-                                // 필터를 통과시킨다. 잡음 실측(press_char.py --s3)이
-                                // 필터 뒤에서는 4.4배 작게 나오기 때문이다.
-                                // 측정이 끝나면 아래 줄을 지우고 그 아래 원본을 되살릴 것.
-                                filtered_P[i] = raw_pressure;
-                                // filtered_P[i] = (0.1f * raw_pressure) + (0.9f * filtered_P[i]);
-                                // ##### 임시 끝 #####
-                            }
+                            // **필터 없이 원시값을 그대로 발행한다 — 2026-08-26 확정.**
+                            // (2026-08-19 "임시 우회"를 영구화했다. 원래 있던 1차 IIR,
+                            //  계수 0.1 = 군지연 ~0.86초 @11Hz 를 되살리면 안 되는 이유:)
+                            //  1) hydro_estimator 가 압력↔자세를 pressure_lag_ms=72ms 로
+                            //     정렬한다 — 12배짜리 미모델 지연이 조용히 끼어든다
+                            //  2) hydro 의 q 저역통과(τ=1s)·데드밴드·배정감시 문턱이 전부
+                            //     **원시 σ(0.189 mbar)** 기준으로 설계돼 있다 (이중 필터 금지)
+                            //  3) CSV 원본이 사후 재계산의 근거다 — 8~15배 잡음 발견 자체가
+                            //     필터를 우회했기에 가능했다
+                            //  4) 무필터 수심 잡음 1.3~2.4mm 는 cm 요구의 5~10배 여유다
+                            // 필터가 필요하면 **소비자 쪽에서** 자기 대역폭에 맞춰 건다
+                            // (수심 제어가 생기면 그 루프가 자기 계수로).
+                            filtered_P[i] = raw_pressure;
 
                             out_pressure_msg.data[i] = filtered_P[i];           // 압력 채널 0,1,2 (mbar)
                             out_pressure_msg.data[i + 3] = TEMP / 100.0f;       // 온도 채널 0,1,2 (C)
-                        } else {
-                            // 환산 불가 — 이 채널은 NaN인 채로 나간다. 다음 사이클이
-                            // 깨끗하게 시작되도록 첫 샘플 플래그도 되돌린다.
-                            first_read[i] = true;
                         }
                     } else {
                         D2[i] = 0;

@@ -181,14 +181,13 @@ clamp events, because its fixed `Kp·dt` correction step must stay bounded. §1.
   the three sensors convert concurrently, so the rate can roughly double with no resolution loss if
   depth control ever needs it. The mux stagger between the three (~0.8 ms at 100 kHz) is the smallest
   delay in the chain by 100×.
-- **`/sensor/pressure_raw` is normally not raw** — "raw" means *before zeroing*. `i2c_driver_node`
-  applies a 1st-order IIR (α 0.1, τ ≈ 0.86 s) before publishing, and the unfiltered signal is kept
-  nowhere — which is exactly why the 8–15× noise above went unnoticed until the filter was bypassed.
-  **That bypass is currently still in place** (temporary, marked `##### [임시 2026-08-19]`; the node
-  logs `※ 압력 IIR 필터 비활성` at startup as the reminder), so pressure is being published unfiltered
-  right now. Decide the coefficient when depth control lands: measured noise 1.3–2.4 mm is already
-  5–10× finer than cm-level needs, while the filter's 0.19 Hz corner sits inside a depth loop's
-  bandwidth and costs 0.86 s of lag (25 cm at 0.3 m/s descent).
+- **`/sensor/pressure_raw` is truly raw — permanently, by decision (2026-08-26).** The driver's
+  1st-order IIR (α 0.1, τ ≈ 0.86 s) was bypassed on 2026-08-19 for characterization and the bypass
+  is now the spec: restoring it would insert ~860 ms of unmodeled group delay under
+  `hydro_estimator_node`'s 72 ms attitude alignment, double-filter a q path whose LPF/deadband/swap
+  thresholds are designed around the **raw** σ (0.189 mbar), and destroy the raw CSV record that
+  post-hoc analysis depends on (the 8–15× noise discovery required the bypass). Consumers filter
+  for themselves; a future depth loop picks its own coefficient in its own node.
 - A dead pressure channel is marked by `prom_C_[i][1] == 0` and reported downstream as `0.0`; the
   estimator treats `< 100 mbar` as invalid.
 - `SERVO_MIN_US`/`SERVO_MAX_US` (1325/1675 since 2026-08-26 — horn ≈ ±20° on the HS-5086WP's

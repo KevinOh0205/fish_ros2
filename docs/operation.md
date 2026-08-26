@@ -124,8 +124,6 @@ journalctl -u fish-robot -b | head -80      # 또는 --since "-5min"
 [ERROR] [I2C Driver] ... I2C 버스 잠김 의심 ...
 ```
 
-**필터 우회 알림** — 현재는 정상(임시 상태): `※ 압력 IIR 필터 비활성 (특성화 측정용)`
-
 **조종기 없음** — 벤치에서는 정상, 2초마다 반복: `[PID Control] 수동 모드 중 조종기 통신 두절`
 
 ---
