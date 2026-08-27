@@ -278,7 +278,7 @@ It carries the water-vs-bench split, the "must be done before water" items, and 
 | `gyro_noise_sigma` validated 2026-08-17 | Allan (2 h, 711k samples): ARW 0.0060–0.0078 °/s/√Hz, bias instability 0.0011–0.0024 °/s at τ 69–434 s. The 0.05 setting is a measured 6.4–8.3× headroom, no longer a guess; `bias_tau` 1000 s and `gyro_bias_rw_sigma` 0.002 are consistent. §3.3 |
 | **Positive pitch = nose DOWN** | opposite of aerospace convention (measured 2026-08-04). Confirm signs before touching the pitch PID or AUTO scenario. §2.1 |
 | Roll/pitch have no offset calibration | **Roll** shows a stable +6.4° over a 3.87-day bench record — that looks like a genuine mounting offset. **Pitch does not**: the "≈ 7.9°" from 2026-08-04 (§2.1) did not reproduce — the same 3.87 days averaged **−0.45°** (range −1.03 … +0.38) and another day read +5.83°. Resting pitch depends on how the robot is set down, so **do not treat 7.9° as a constant**. `hydro_estimator_node` used it as an attitude fallback until 2026-08-25; that fallback is gone (speed is NaN without attitude). |
-| Post-assembly tests pending | tail-beat pitch bias, PID sign bench check **before water**, multi-attitude tilt accuracy. §8.2 |
+| Post-assembly tests pending | tail-beat pitch bias, PID sign bench check **before water**. §8.2 (multi-attitude tilt PASSED 2026-08-27: all six poses ≤ 0.61° vs gravity, incl. pitch ±89°, §11.2) |
 | `data_logger_node` total log volume unbounded | ~84 MB/hour since raw pressure columns (2026-08-21; ~80 MB since 2026-08-18). Per-file 200 MB rotation exists, but old files are never deleted (deliberate — `log_csv/` also holds the experiment CSVs; the calibration files now live in `config/`). Disk space is managed by hand. |
 
 ## Language
