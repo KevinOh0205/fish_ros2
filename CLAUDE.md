@@ -159,7 +159,9 @@ upper clamp (covariance adjusts trust). §1.3.
 
 - **`gpiochip4`**, not `gpiochip0` — the Pi 5 moved the 40-pin header onto the RP1 chip. Changing
   boards means changing `rpm_driver_node.cpp`.
-- RPM resolution is coarse: 1 pulse per 100 ms window = **200 RPM**.
+- RPM resolution is coarse: 1 pulse per 100 ms window = **150 RPM** (1 rev = 4 hall pulses,
+  measured 2026-08-27; the old "3 pulses/rev" spec assumption read 33 % high). Hand-turn encoder
+  tests need the motor battery connected — without it ~2/3 of pulses are missed.
 - The three pressure sensors are **MS5837-02BA** (swapped from 30BA on 2026-08-20). The two models
   need **different compensation constants** — using 30BA math on an 02BA reads exactly **20× high**
   (measured: 20132.60 vs 1006.63 mbar) and sails past the estimator's `>= 100 mbar` validity test,
