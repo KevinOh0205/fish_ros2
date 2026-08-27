@@ -98,6 +98,10 @@ matter to them, only direction. **Any new consumer of this topic must convert.**
 
 - `/rc/command` is a `geometry_msgs/Quaternion` holding **4 raw stick ints**, not a rotation:
   `x=roll, y=pitch, z=yaw, w=throttle`. Same for `/auto/command` (`x/y/z` in **0.1°**, `w` in **PWM µs**).
+  Measured full-stick ranges (2026-08-27): roll −272~+242, pitch −266~+251, **yaw only −85~+86**
+  (1/3 the scale of roll/pitch — nRF-side mapping), throttle 0~+1171 (the code's 1171 constant is
+  exact). Sticks map to target angle at ×0.1°/count in `pid_control_node`, so full yaw stick
+  commands only a ±7° heading target.
 - `/rc/status` is `Int32MultiArray[5]` = `[btn1, btn2, vbat1×100, vbat2×100, rssi]`. Voltages are
   centivolts — divide by 100.
 - `/sensor/pressure_raw` is `Float32MultiArray[6]`: `[0..2]` pressure (mbar), `[3..5]` temperature (°C).
