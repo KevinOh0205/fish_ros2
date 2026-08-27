@@ -101,7 +101,8 @@ matter to them, only direction. **Any new consumer of this topic must convert.**
   Measured full-stick ranges (2026-08-27): roll −272~+242, pitch −266~+251, **yaw only −85~+86**
   (1/3 the scale of roll/pitch — nRF-side mapping), throttle 0~+1171 (the code's 1171 constant is
   exact). Sticks map to target angle at ×0.1°/count in `pid_control_node`, so full yaw stick
-  commands only a ±7° heading target.
+  commands only a ±7° heading target — **left as-is by operator decision (2026-08-27)**; the yaw
+  stick is fine-heading-correction only. Don't "fix" the scale without a new operator request.
 - `/rc/status` is `Int32MultiArray[5]` = `[btn1, btn2, vbat1×100, vbat2×100, rssi]`. Voltages are
   centivolts — divide by 100.
 - `/sensor/pressure_raw` is `Float32MultiArray[6]`: `[0..2]` pressure (mbar), `[3..5]` temperature (°C).
