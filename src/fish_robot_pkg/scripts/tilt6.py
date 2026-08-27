@@ -68,7 +68,7 @@ class Tilt(Node):
                 em = ang(upvec(*self.mah), up); ee = ang(upvec(*self.ekf), up)
                 sys.stdout.write(f"\r  {el:4.1f}/{sec:.0f}s  |a|{na:5.3f}g  "
                                  f"자이로{np.abs(self.gyr).max():5.2f}도/초  "
-                                 f"Mahony {em:5.3f}도  EKF {ee:5.3f}도   ")
+                                 f"제어출력 {em:5.3f}도  순수EKF {ee:5.3f}도   ")
                 sys.stdout.flush()
         return np.array(rows)
 
@@ -108,13 +108,14 @@ def main():
         print(f"    중력 {'정지 OK' if ok else '★ 흔들림 감지'}  "
               f"(방향 흔들림 {spread:.2f}도, 자이로 최대 {gmax:.2f}도/초)")
         print(f"    자세  roll {A[:,8].mean():+7.2f}  pitch {A[:,9].mean():+7.2f}")
-        print(f"    Mahony {em.mean():6.3f} +-{em.std():5.3f} 도    "
-              f"EKF {ee.mean():6.3f} +-{ee.std():5.3f} 도\n")
+        print(f"    제어출력 {em.mean():6.3f} +-{em.std():5.3f} 도    "
+              f"순수EKF {ee.mean():6.3f} +-{ee.std():5.3f} 도\n")
         out.append((p, A[:, 8].mean(), A[:, 9].mean(), em.mean(), em.std(),
                     ee.mean(), ee.std(), ok))
 
     print("=" * 74)
-    print(f"{'자세':<26}{'roll':>8}{'pitch':>8}{'Mahony':>11}{'EKF':>11}{'정지':>6}")
+    # 주의: Mahony 은퇴 후(2026-08) 두 열 모두 EKF — 왼쪽은 제어 출력, 오른쪽은 순수값
+    print(f"{'자세':<26}{'roll':>8}{'pitch':>8}{'제어출력':>10}{'순수EKF':>10}{'정지':>6}")
     print("-" * 74)
     for p, r, pi, m1, m2, e1, e2, ok in out:
         print(f"{p:<26}{r:+8.2f}{pi:+8.2f}{m1:8.3f}±{m2:.2f}{e1:8.3f}±{e2:.2f}"
