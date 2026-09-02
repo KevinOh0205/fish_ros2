@@ -378,50 +378,160 @@ cd ~/ros2_ws && colcon build --packages-select fish_robot_pkg
 
 ### D. 벤치 스크립트 (`src/fish_robot_pkg/scripts/`)
 
-전부 `python3 <경로>` 로 돌린다. 경로는 `~/ros2_ws/src/fish_robot_pkg/scripts/`.
-**서비스를 내려야 하는 것과 켠 채로 되는 것이 갈린다** — 아래 "서비스" 열을 반드시 볼 것.
-구독만 하는 스크립트는 서비스가 도는 채로 그대로 쓴다.
+대부분 `ros2 run` 에 등록돼 있지 않다 — **`python3 <경로>` 로 직접** 돌린다.
+(`magneto_cal.py` 와 `verify_spin.py` 둘만 `ros2 run` 으로도 된다.)
+
+```bash
+# 매번 먼저 (모든 스크립트 공통)
+cd ~/ros2_ws && source install/setup.bash
+
+# "서비스 내릴 것" 표시가 있는 스크립트만
+sudo systemctl stop fish-robot
+#   ... 시험 ...
+sudo systemctl start fish-robot      # 끝나면 반드시 되돌린다
+```
+
+아래에서 경로는 전부 `S=~/ros2_ws/src/fish_robot_pkg/scripts` 로 줄여 적는다.
+종료는 따로 적지 않은 한 **Ctrl-C**.
 
 #### D.1 조종기 · 서보
 
-| 스크립트 | 무엇을 하나 | 서비스 |
-|---|---|---|
-| `rc_map.py` | 스틱 4칸이 어느 값으로 오는지 막대로 본다. 채널 뒤바뀜(다른 칸이 움직임)과 부호 반전(같은 칸, 반대 방향)을 가른다. Ctrl-C 하면 채널별 실측 범위를 찍는다 | 켠 채로 |
-| `rc_check.py` | 조종기→서보 경로 어디가 끊겼는지 좁힌다. `/rc/command`가 안 변하면 조종기·수신기·nRF 쪽, 변하는데 `/motor/output`이 안 따라오면 Pi 쪽 | 켠 채로 |
-| `servo_toggle.py` | 2초마다 1350↔1650을 번갈아 보낸다. 서보가 그 리듬으로 크게 움직이면 Pi→nRF→서보 경로가 살아 있는 것. 느리고 크게 하는 이유는 **떨림과 구분**하기 위해서다 | **내릴 것** |
-| `servo_direct.py` | 스틱을 서보에 직결한다(PID 없음). 책상 위에서는 로봇이 실제로 기울 수 없어 PID가 포화되므로, 배선·방향·가동범위 확인은 이걸로 한다. **서보 중립(1500) 확인도 여기서** | **내릴 것** |
-| `servo_hold.py` | 완전히 고정된 값을 100 Hz로 계속 보낸다. 그래도 떨리면 명령과 무관(전원·PWM·서보 자체), 안 떨리면 명령의 1 µs 변동에 서보가 반응하는 것 | **내릴 것** |
+**`rc_map.py`** — 서비스 켠 채로
+```bash
+python3 $S/rc_map.py
+```
+스틱 4칸이 어느 값으로 오는지 막대로 본다. 채널 뒤바뀜(다른 칸이 움직임)과 부호 반전
+(같은 칸, 반대 방향)을 가른다. Ctrl-C 하면 채널별 실측 범위를 찍는다.
 
-`servo_*` 세 개는 `/motor/output`을 직접 발행한다. 서비스를 켠 채로 돌리면
-`pid_control_node`와 같은 토픽에 두 발행자가 붙어 명령이 두 값 사이에서 튄다.
+**`rc_check.py`** — 서비스 켠 채로
+```bash
+python3 $S/rc_check.py
+```
+조종기→서보 경로 어디가 끊겼는지 좁힌다. `/rc/command` 가 안 변하면 조종기·수신기·nRF 쪽,
+변하는데 `/motor/output` 이 안 따라오면 Pi 쪽.
+
+**`servo_toggle.py`** — ⚠️ **서비스 내릴 것**
+```bash
+sudo systemctl stop fish-robot
+python3 $S/servo_toggle.py
+```
+2초마다 1350↔1650 을 번갈아 보낸다. 서보가 그 리듬으로 크게 움직이면 Pi→nRF→서보 경로가
+살아 있는 것. 느리고 크게 하는 이유는 **떨림과 구분**하기 위해서다.
+
+**`servo_direct.py`** — ⚠️ **서비스 내릴 것**
+```bash
+sudo systemctl stop fish-robot
+python3 $S/servo_direct.py
+```
+스틱을 서보에 직결한다(PID 없음). 책상 위에서는 로봇이 실제로 기울 수 없어 PID 가 포화되므로,
+배선·방향·가동범위 확인은 이걸로 한다. **서보 중립(1500) 확인도 여기서.**
+
+**`servo_hold.py`** — ⚠️ **서비스 내릴 것**
+```bash
+sudo systemctl stop fish-robot
+python3 $S/servo_hold.py            # 서보 1500, 꼬리 1000(정지)
+python3 $S/servo_hold.py 1400       # 서보 값 지정
+python3 $S/servo_hold.py 1500 1200  # 서보, 꼬리 ESC 값 지정
+```
+완전히 고정된 값을 100 Hz 로 계속 보낸다. 그래도 떨리면 명령과 무관(전원·PWM·서보 자체),
+안 떨리면 명령의 1 µs 변동에 서보가 반응하는 것.
+
+> `servo_*` 세 개는 `/motor/output` 을 직접 발행한다. 서비스를 켠 채로 돌리면
+> `pid_control_node` 와 같은 토픽에 두 발행자가 붙어 명령이 두 값 사이에서 튄다.
 
 #### D.2 압력
 
-| 스크립트 | 무엇을 하나 | 서비스 |
-|---|---|---|
-| `mux_probe.py` | 먹스 채널 상태와 센서 상태를 **분리**해 진단한다. 인자로 두드릴 횟수(기본 5, 접촉 불량 의심이면 `20`). 탐지는 반드시 쓰기(리셋 0x1E)로 한다 — `i2cdetect`로는 멀쩡한 센서도 못 찾는다 | **내릴 것** |
-| `press_watch.sh` | 채널 접촉 상태 실시간 감시(`bash press_watch.sh`). 켜둔 채 커넥터를 눌러보거나 케이블을 흔들면 붙는 순간 ●로 바뀐다 — 접촉 불량 자세를 찾는 용도 | **내릴 것** |
-| `press_char.py` | 특성화. `press_char.py [초]`로 기록(기본 3600), `--s1`(안정화 시간) `--s2`(영점·현행 절차 오차) `--s3`(잡음·최대최소폭)로 분석. `--after <초>`로 안정 구간 시작점 지정 | 켠 채로(기록) |
+**`mux_probe.py`** — ⚠️ **서비스 내릴 것** (I2C 버스를 직접 잡는다)
+```bash
+sudo systemctl stop fish-robot
+python3 $S/mux_probe.py             # 채널당 5회 두드림
+python3 $S/mux_probe.py 20          # 접촉 불량 의심이면 20회
+```
+먹스 채널 상태와 센서 상태를 **분리**해 진단한다. 탐지는 반드시 쓰기(리셋 0x1E)로 한다 —
+`i2cdetect` 로는 멀쩡한 센서도 못 찾는다.
 
-`mux_probe.py`의 한계 — **PROM만 본다.** 2026-09-02에 리셋·PROM은 정상인데 ADC 변환만
-전부 거부하는 개체가 나왔는데 이 도구는 "정상"이라고 답했다. 압력이 NaN인데 mux_probe가
-정상이면 변환 명령(0x4A/0x5A)까지 직접 두드려 봐야 한다.
+**`press_watch.sh`** — ⚠️ **서비스 내릴 것**
+```bash
+sudo systemctl stop fish-robot
+bash $S/press_watch.sh
+```
+채널 접촉 상태 실시간 감시. 켜둔 채 커넥터를 눌러보거나 케이블을 흔들면 붙는 순간 ● 로
+바뀐다 — 접촉 불량 자세를 찾는 용도.
+
+**`press_char.py`** — 기록은 서비스 켠 채로, 분석은 아무 때나
+```bash
+python3 $S/press_char.py 3600                   # 기록 (초, 기본 3600)
+python3 $S/press_char.py --s1 <csv>             # 안정화 시간
+python3 $S/press_char.py --s2 <csv>             # 영점·현행 절차 오차
+python3 $S/press_char.py --s3 <csv>             # 잡음·최대최소폭
+python3 $S/press_char.py --s3 <csv> --after 300 # 안정 구간 시작점 지정
+```
+
+> `mux_probe.py` 의 한계 — **PROM 만 본다.** 2026-09-02 에 리셋·PROM 은 정상인데 ADC 변환만
+> 전부 거부하는 개체가 나왔는데 이 도구는 "정상" 이라고 답했다. 압력이 NaN 인데 mux_probe 가
+> 정상이면 변환 명령(0x4A/0x5A)까지 직접 두드려 봐야 한다.
 
 #### D.3 자세 · IMU · 지자기
 
-| 스크립트 | 무엇을 하나 | 서비스 |
-|---|---|---|
-| `magneto_cal.py` | 지자기 보정(텀블 + 타원체 피팅). 여섯 자세를 하나씩 잡고 **그 자세 그대로 제자리에서 한 바퀴**. 진행 막대는 **자이로**로 잰다(자기장으로 재면 하드아이언 때문에 안 찬다). 흩어짐 8 % 넘으면 저장 거부. `--no-write`로 저장 없이 결과만 | 켠 채로 |
-| `tilt6.py` | 여섯 자세에서 기울기 정확도를 중력 벡터로 채점한다. 자세당 20초. 오일러각이 아니라 중력으로 채점하므로 피치 ±90° 근처도 유효 | 켠 채로 |
-| `verify_spin.py` | 360° 회전 끝단 검증. 자이로 적분각을 정답으로 놓고 지자기 헤딩이 되돌아옴 없이 360°까지 단조 증가하는지 본다 | 켠 채로 |
-| `drift_test.py` | 6축 yaw 드리프트 게이트(≤ 2 °/분). **반드시 `use_mag:=false`로 띄운 EKF에 대고** 돌릴 것 — 9축이면 지자기가 yaw를 잡아줘 시험이 무의미하다 | 별도 기동 |
-| `allan.py` | Allan 분산으로 `gyro_noise_sigma`의 근거를 만든다. `allan.py 7200`(초, 2시간 이상) 기록 → `allan.py --an <csv>` 분석 | 켠 채로(기록) |
-| `magloss.py` | 지자기 상실 → 6축 폴백 전환을 시험한다. `i2c_driver_node`를 죽이지 않고 SIGSTOP으로 얼린다(죽이면 respawn되고 압력까지 끊긴다). 전환 지연·튐·복귀를 본다 | 켠 채로 |
-| `exp_b.py` | 옛 실험 — 9축 Mahony vs 9축 EKF 비교 | **현재 무의미** |
+**`magneto_cal.py`** — 서비스 켠 채로
+```bash
+python3 $S/magneto_cal.py                # 보정 후 저장
+python3 $S/magneto_cal.py --no-write     # 저장 없이 결과만 (먼저 이걸 권장)
+ros2 run fish_robot_pkg magneto_cal.py   # 같은 것
+```
+여섯 자세를 하나씩 잡고 **그 자세 그대로 제자리에서 한 바퀴** 돈다. 진행 막대는 **자이로**로
+잰다(자기장으로 재면 하드아이언 때문에 안 찬다). 흩어짐 8 % 넘으면 저장을 거부한다.
+btn2 3초·`/calibrate_mag` 도 같은 스크립트를 돌리지만, 그쪽은 출력이 저널로 가서
+**막대 화면을 보려면 위 명령으로 직접** 띄워야 한다.
 
-`exp_b.py`는 Mahony 노드가 은퇴(2026-08)한 뒤로 `/filtered/attitude`와
-`/filtered/attitude_ekf`가 **둘 다 EKF**라 같은 값을 비교한다. `tilt6.py`도 같은 이유로
-두 열이 소수 4째 자리까지 일치한다(왼쪽=제어 출력, 오른쪽=순수값). 남겨둔 것은 기록용이다.
+**`tilt6.py`** — 서비스 켠 채로
+```bash
+python3 $S/tilt6.py
+```
+여섯 자세에서 기울기 정확도를 중력 벡터로 채점한다. 자세마다 놓고 Enter, 자세당 20초.
+오일러각이 아니라 중력으로 채점하므로 피치 ±90° 근처도 유효하다.
+
+**`verify_spin.py`** — 서비스 켠 채로
+```bash
+python3 $S/verify_spin.py
+ros2 run fish_robot_pkg verify_spin.py   # 같은 것
+```
+360° 회전 끝단 검증. 자이로 적분각을 정답으로 놓고 지자기 헤딩이 되돌아옴 없이 360°까지
+단조 증가하는지 본다.
+
+**`allan.py`** — 기록은 서비스 켠 채로, 로봇을 **완전히 정지**시켜 둘 것
+```bash
+python3 $S/allan.py 7200          # 기록 (초, 2시간 이상 권장)
+python3 $S/allan.py --an <csv>    # 분석
+```
+
+**`magloss.py`** — 서비스 켠 채로 (`i2c_driver_node` 를 SIGSTOP 으로 얼린다)
+```bash
+python3 $S/magloss.py
+```
+지자기 상실 → 6축 폴백 전환을 시험한다. 죽이지 않고 얼리는 이유는 죽이면 respawn 되고
+압력까지 끊기기 때문. 전환 지연·튐·복귀를 본다.
+
+**`drift_test.py`** — ⚠️ **별도 기동 필요** (`use_mag:=false` 인 EKF 가 있어야 한다)
+```bash
+sudo systemctl stop fish-robot
+# 터미널 1 — IMU 공급 + 지자기 끈 EKF
+ros2 run fish_robot_pkg uart_bridge_node &
+ros2 run fish_robot_pkg state_estimation_ekf_node --ros-args -p use_mag:=false
+# 터미널 2
+python3 $S/drift_test.py
+```
+6축 yaw 드리프트 게이트(≤ 2 °/분). launch 는 `use_mag` 를 True 로 박아두므로 서비스로는
+이 시험을 못 한다 — 9축이면 지자기가 yaw 를 잡아줘 시험이 무의미하다.
+
+**`exp_b.py`** — 옛 실험, **현재 무의미**
+```bash
+python3 $S/exp_b.py
+```
+
+> `exp_b.py` 는 Mahony 노드가 은퇴(2026-08)한 뒤로 `/filtered/attitude` 와
+> `/filtered/attitude_ekf` 가 **둘 다 EKF** 라 같은 값을 비교한다. `tilt6.py` 도 같은 이유로
+> 두 열이 소수 4째 자리까지 일치한다(왼쪽=제어 출력, 오른쪽=순수값). 남겨둔 것은 기록용이다.
 
 ### E. 관련 문서
 
