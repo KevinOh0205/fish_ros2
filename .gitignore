@@ -24,3 +24,6 @@ log/
 # 파이썬 바이트코드 (launch/scripts 실행 시 자동 생성)
 __pycache__/
 *.pyc
+
+# 지자기 보정 백업 — magneto_cal.py 가 저장 때마다 만든다. 원본만 추적하면 된다.
+/config/*.bak_*
