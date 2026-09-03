@@ -384,13 +384,16 @@ private:
     //   btn1 길게 : 대기압 영점 재수집
     //   btn2 짧게 : 현재 방향을 Yaw 0도로 (yaw_offset_ — /filtered/attitude 에만 적용)
     //   btn2 길게 : magneto_cal.py 실행 / 진행 중이면 SIGINT 조기 종료
-    //   **btn1+btn2 동시** : AUTO 시나리오 전환 (/ui/scenario_next 발행)
+    //   **btn1+btn2 동시 3초** : AUTO 시나리오 전환 (/ui/scenario_next 발행)
     //
     // 조합 규약 (2026-09-03): 누르고 있는 동안 상대 버튼이 **한 번이라도** 같이 눌리면
     // 그 누름은 '조합'으로 확정되고, 양쪽의 단독 동작(모드 토글·헤딩 영점·지자기 보정)을
-    // 전부 억제한 뒤 조합 동작만 1회 실행한다. 래치는 **둘 다 뗀 뒤에** 풀린다 —
-    // 손을 떼는 시점이 어긋나도(실측 0.1초 차) 나중에 떼는 쪽이 단독 동작을 내지 않게
-    // 하기 위해서다. 누름 길이에 의존하지 않으므로 빨리 누르든 2초를 누르든 같다.
+    // 전부 억제한다. 래치는 **둘 다 뗀 뒤에** 풀린다 — 손을 떼는 시점이 어긋나도
+    // (실측 0.1초 차) 나중에 떼는 쪽이 단독 동작을 내지 않게 하기 위해서다.
+    //
+    // **전환은 둘이 같이 눌린 채로 정확히 300틱(3초)에서 1회** 발화한다. 짧은 조합은
+    // 아무 일도 일으키지 않지만 억제는 그대로다 — 실수로 둘을 스쳤을 때 모드가 뒤집히거나
+    // 헤딩 영점이 잡히면 안 되기 때문이다. 3초에 못 미쳐 떼면 그 사실을 로그로 알린다.
     // (동시 인식 자체는 2026-09-03 실측 확인 — 3회 시도 전부 btn1=1,btn2=1 로 잡혔다)
     void rc_status_callback(const std_msgs::msg::Int32MultiArray::SharedPtr msg) {
         if (msg->data.size() < 2) return;
@@ -408,7 +411,19 @@ private:
 
         // ── 조합 감지 ─────────────────────────────────────────────────────
         // 둘이 같은 틱에 눌려 있으면 이번 누름은 조합으로 확정한다(래치).
-        if (btn1 == 1 && btn2 == 1) combo_seen_ = true;
+        // 전환은 **둘이 같이 눌린 채로** 3초를 채워야 한다. 한쪽이라도 떨어지면
+        // 카운터를 0으로 되돌린다(래치 combo_seen_ 는 유지 — 억제는 계속돼야 한다).
+        if (btn1 == 1 && btn2 == 1) {
+            combo_seen_ = true;
+            ++combo_counter_;
+            if (combo_counter_ > combo_peak_)  combo_peak_ = combo_counter_;
+            if (combo_counter_ == 300) fire_scenario_next();     // >= 가 아니라 == : 1회만
+        } else {
+            // 한쪽이 떨어지면 3초 카운트는 처음부터 — 함께 붙들고 있어야 전환이다.
+            // 다만 **최고 기록(combo_peak_)은 남긴다**: 뗌이 어긋나면 여기서 0 이 되어
+            // "몇 초 눌렀나" 를 보고할 수 없다(실측: 2초를 눌렀는데 0.0초로 찍혔다).
+            combo_counter_ = 0;
+        }
 
         // 버튼 1
         if (btn1 == 1) {
@@ -422,7 +437,7 @@ private:
         } else {
             if (prev_btn1_ == 1) {   // Falling Edge = 손을 뗀 순간
                 if (combo_seen_) {
-                    fire_scenario_next();          // 조합 — 모드 토글은 하지 않는다
+                    report_short_combo();          // 조합 — 모드 토글은 하지 않는다
                 } else
                 // 30ms 이상 1초 미만이고 롱프레스로 처리되지 않았을 때만 짧은 누름
                 if (btn1_counter_ > 3 && btn1_counter_ < 100 && !btn1_long_processed_) {
@@ -452,7 +467,7 @@ private:
         } else {
             if (prev_btn2_ == 1) {
                 if (combo_seen_) {
-                    fire_scenario_next();          // 조합 — 헤딩 영점은 잡지 않는다
+                    report_short_combo();          // 조합 — 헤딩 영점은 잡지 않는다
                 } else
                 if (btn2_counter_ > 3 && btn2_counter_ < 100 && !btn2_long_processed_) {
                     // 헤딩 영점: 현재 바라보는 방향을 Yaw 0도로 삼는다.
@@ -470,18 +485,31 @@ private:
 
         // 래치는 **둘 다 뗀 뒤에** 푼다. 먼저 뗀 쪽에서 풀면, 나중에 떼는 쪽이
         // 자기 단독 동작을 내버린다 (실측: 두 버튼의 뗌이 0.1초 어긋났다).
-        if (btn1 == 0 && btn2 == 0) { combo_seen_ = false; combo_fired_ = false; }
+        if (btn1 == 0 && btn2 == 0) {
+            combo_seen_ = false; combo_fired_ = false; combo_counter_ = 0; combo_peak_ = 0;
+        }
     }
 
-    // 조합 1회 발화 — 어느 쪽을 먼저 떼든 한 번만 나간다.
+    // 조합 3초 달성 — 1회만 발화한다.
     void fire_scenario_next() {
         if (combo_fired_) return;
         combo_fired_ = true;
         scenario_next_pub_->publish(std_msgs::msg::Empty());
         RCLCPP_WARN(this->get_logger(), "======================================================");
-        RCLCPP_WARN(this->get_logger(), "[EKF] 두 버튼 동시 — AUTO 시나리오 전환 신호를 보냈습니다.");
+        RCLCPP_WARN(this->get_logger(), "[EKF] 두 버튼 동시 3초 — AUTO 시나리오 전환 신호를 보냈습니다.");
         RCLCPP_WARN(this->get_logger(), "      (모드 토글·헤딩 영점은 이번 누름에서 억제됨)");
         RCLCPP_WARN(this->get_logger(), "======================================================");
+    }
+
+    // 3초를 못 채우고 뗀 조합 — 아무 동작도 하지 않았다는 사실을 알린다.
+    // 이게 없으면 "눌렀는데 왜 안 바뀌지"를 로봇을 봐서는 알 수 없다.
+    void report_short_combo() {
+        if (combo_fired_) return;
+        combo_fired_ = true;
+        RCLCPP_WARN(this->get_logger(),
+            "[EKF] 두 버튼 조합이 3초에 못 미쳐(%.1f초) 시나리오를 바꾸지 않았습니다. "
+            "단독 동작도 억제됐습니다 — 전환하려면 둘을 함께 3초 유지하세요.",
+            combo_peak_ * 0.01);
     }
 
     // =========================================================================
@@ -1453,7 +1481,9 @@ private:
     int  prev_btn1_; int prev_btn2_;       // 엣지 판정용 직전 상태
     bool btn1_long_processed_; bool btn2_long_processed_;
     bool combo_seen_ = false;              // 이번 누름이 조합으로 확정됐는가
-    bool combo_fired_ = false;             // 조합 동작을 이미 1회 실행했는가
+    bool combo_fired_ = false;             // 이번 조합에 대해 이미 처리(발화/보고)했는가
+    int  combo_counter_ = 0;               // 둘이 함께 눌린 틱 수 (300 = 3초)
+    int  combo_peak_ = 0;                  // 이번 조합에서 함께 눌렸던 최대 틱 (보고용)
     rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr scenario_next_pub_;
 
     // ---- yaw 영점 (btn2 짧게) ----

@@ -237,10 +237,13 @@ Short press = 30 ms–1 s; long press = exactly 3 s (`== 300`, fires once).
 | btn1 | AUTO/MANUAL toggle | re-zero atmospheric pressure, **in air only** — refused above 5 mbar gauge (**handled by `hydro_estimator_node`** since 2026-08-21; the EKF still detects the 3 s hold, but only to suppress the release from counting as a short press). The in-water q zero is deliberately *not* on this button; call `/hydro/zero_q` for it |
 | btn2 | set current heading as yaw 0 | run `magneto_cal.py` (ellipsoid); long-press again = finish collection early (SIGINT) |
 
-**btn1+btn2 together = advance the AUTO scenario** (2026-09-03). While either button is held, if the
-other is down on any tick the press is latched as a *combo*: every single-button action is suppressed
-(mode toggle, heading zero, mag calibration, and `hydro_estimator_node`'s atmospheric re-zero) and the
-combo fires once, publishing `/ui/scenario_next`. `auto_scenario_node` steps through `combo_list`
+**btn1+btn2 held together for 3 s = advance the AUTO scenario** (2026-09-03). While either button is
+held, if the other is down on any tick the press is latched as a *combo*: every single-button action is
+suppressed (mode toggle, heading zero, mag calibration, and `hydro_estimator_node`'s atmospheric
+re-zero). **The scenario only advances at exactly 300 ticks of both being down**, publishing
+`/ui/scenario_next`; a shorter combo does nothing but still suppresses, and logs how long it was held
+(report the *peak* tick count, not the live counter — the counter resets the instant either button
+lifts, which made a 2 s press report "0.0초"). `auto_scenario_node` steps through `combo_list`
 (default `straight,dive`) on that signal. **The latch clears only when BOTH are released** — the two
 releases were measured 0.1 s apart, and clearing on the first would let the later one fire its own
 action. Combo detection lives in `state_estimation_ekf_node` (which must suppress anyway) plus a
