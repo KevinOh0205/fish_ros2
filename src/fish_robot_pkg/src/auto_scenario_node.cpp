@@ -11,7 +11,17 @@
 //  목표 자세·추력을 적어두면 되고, 새 시나리오를 넣는 일은 표를 하나 더
 //  쓰는 것이 전부다(build_steps() 참조).
 //
-//  선택은 ROS 파라미터로 한다. 재빌드도 재시작도 필요 없다:
+//  ── 조종기로 전환 (2026-09-03) ────────────────────────────────────────────
+//  **btn1+btn2 동시 누름** = 시나리오 전환. state_estimation_ekf_node 가 조합을
+//  감지해 `/ui/scenario_next` 를 발행하고, 이 노드가 `combo_list` 를 한 칸 돌린다.
+//  기본 목록은 "straight,dive" — 직진과 "같은 추력으로 코를 숙이고 전진" 둘이다.
+//     ros2 param set /auto_scenario_node combo_list "straight,dive,turn"
+//
+//  ※ 조합은 **모드를 바꾸지 않는다.** 시나리오만 갈아 끼우고, 실제 주행은 btn1 단독
+//     누름으로 AUTO 에 들어갈 때 시작된다. 전환은 저널에 크게 남는다 — 지금 무엇이
+//     걸려 있는지는 로봇을 봐서는 알 수 없으므로 로그가 유일한 확인 수단이다.
+//
+//  선택은 ROS 파라미터로도 한다. 재빌드도 재시작도 필요 없다:
 //     ros2 param set /auto_scenario_node scenario dive
 //     ros2 param set /auto_scenario_node run_sec 5.0
 //     ros2 param set /auto_scenario_node throttle_pct 30.0
@@ -51,6 +61,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
+#include <std_msgs/msg/empty.hpp>
+#include <sstream>
 #include <vector>
 #include <string>
 #include <cmath>
@@ -79,6 +91,7 @@ public:
         run_sec_      = this->declare_parameter<double>("run_sec", 3.0);
         throttle_pct_ = this->declare_parameter<double>("throttle_pct", 20.0);
         angle_deg_    = this->declare_parameter<double>("angle_deg", 15.0);
+        combo_list_   = parse_list(this->declare_parameter<std::string>("combo_list", "straight,dive"));
 
         param_cb_ = this->add_on_set_parameters_callback(
             [this](const std::vector<rclcpp::Parameter> &ps) {
@@ -96,6 +109,15 @@ public:
                             continue;
                         }
                         scenario_ = v;
+                    } else if (n == "combo_list") {
+                        auto v = parse_list(p.as_string());
+                        if (v.empty()) {
+                            r.successful = false;
+                            r.reason = "combo_list 가 비었거나 모르는 이름만 있습니다";
+                            RCLCPP_ERROR(this->get_logger(), "[AUTO] %s", r.reason.c_str());
+                            continue;
+                        }
+                        combo_list_ = v; combo_idx_ = 0;
                     } else if (n == "run_sec")      run_sec_      = p.as_double();
                     else if (n == "throttle_pct")   throttle_pct_ = p.as_double();
                     else if (n == "angle_deg")      angle_deg_    = p.as_double();
@@ -115,6 +137,11 @@ public:
 
         auto_cmd_pub_ = this->create_publisher<geometry_msgs::msg::Quaternion>("/auto/command", 10);
 
+        // btn1+btn2 동시 (EKF 가 조합을 판정해 보내준다) -> 시나리오 한 칸 전환
+        scenario_next_sub_ = this->create_subscription<std_msgs::msg::Empty>(
+            "/ui/scenario_next", 10,
+            [this](const std_msgs::msg::Empty::SharedPtr) { advance_scenario(); });
+
         // 자세 토픽은 모드 감별과 진입 헤딩 포착에만 쓴다 (제어각은 PID 노드가 쓴다)
         attitude_sub_ = this->create_subscription<geometry_msgs::msg::Vector3>(
             "/filtered/attitude", 10, std::bind(&AutoScenarioNode::attitude_callback, this, std::placeholders::_1));
@@ -124,6 +151,41 @@ public:
     }
 
 private:
+    // "straight,dive" -> {"straight","dive"}. 모르는 이름은 버리고 경고한다.
+    std::vector<std::string> parse_list(const std::string &csv) const {
+        std::vector<std::string> out;
+        std::stringstream ss(csv);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            tok.erase(0, tok.find_first_not_of(" \t"));
+            const auto e = tok.find_last_not_of(" \t");
+            if (e != std::string::npos) tok.erase(e + 1);
+            if (tok.empty()) continue;
+            if (!is_known_scenario(tok)) {
+                RCLCPP_ERROR(this->get_logger(), "[AUTO] combo_list 의 '%s' 는 모르는 시나리오 — 건너뜁니다", tok.c_str());
+                continue;
+            }
+            out.push_back(tok);
+        }
+        return out;
+    }
+
+    // 조합 누름 1회 = 목록에서 다음 시나리오. **모드는 건드리지 않는다.**
+    void advance_scenario() {
+        if (combo_list_.empty()) {
+            RCLCPP_ERROR(this->get_logger(), "[AUTO] combo_list 가 비어 전환할 수 없습니다");
+            return;
+        }
+        combo_idx_ = (combo_idx_ + 1) % combo_list_.size();
+        scenario_  = combo_list_[combo_idx_];
+        RCLCPP_WARN(this->get_logger(), "======================================================");
+        RCLCPP_WARN(this->get_logger(), "[AUTO] 시나리오 전환 -> '%s'  (%zu/%zu)  %.1f초 추력 %.0f%% 각도 %.1f도",
+                    scenario_.c_str(), combo_idx_ + 1, combo_list_.size(),
+                    run_sec_, throttle_pct_, angle_deg_);
+        RCLCPP_WARN(this->get_logger(), "       btn1 짧게로 AUTO 에 들어가면 이 시나리오가 실행됩니다.");
+        RCLCPP_WARN(this->get_logger(), "======================================================");
+    }
+
     static bool is_known_scenario(const std::string &s) {
         return s == "straight" || s == "dive" || s == "climb"
             || s == "turn"     || s == "porpoise" || s == "attitude";
@@ -262,6 +324,8 @@ private:
     // 설정값 (파라미터, 언제든 바뀔 수 있다)
     std::string scenario_;
     double run_sec_, throttle_pct_, angle_deg_;
+    std::vector<std::string> combo_list_;   // 조합 누름이 순환할 시나리오 목록
+    size_t combo_idx_ = 0;
 
     // 이번 주행에 잠긴 값 (진입 순간 복사)
     std::string active_scenario_;
@@ -272,6 +336,7 @@ private:
 
     rclcpp::Publisher<geometry_msgs::msg::Quaternion>::SharedPtr auto_cmd_pub_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr attitude_sub_;
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr scenario_next_sub_;
     rclcpp::TimerBase::SharedPtr loop_timer_;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
 };

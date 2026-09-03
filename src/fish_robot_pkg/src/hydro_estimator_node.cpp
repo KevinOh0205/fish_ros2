@@ -1146,19 +1146,30 @@ private:
     // 판정 규칙은 EKF/구 노드와 **똑같이** 맞춘다 (1틱 = 10ms, == 300 에서 1회).
     // 다르게 두면 같은 버튼이 두 노드에서 다른 시점에 반응한다.
     void rc_status_callback(const std_msgs::msg::Int32MultiArray::SharedPtr msg) {
-        if (msg->data.empty()) return;
+        if (msg->data.size() < 2) return;
         const int32_t btn1 = msg->data[0];
+        const int32_t btn2 = msg->data[1];
 
         // 링크 두절 시 nRF는 버튼을 255로 보낸다. 1->255 전이를 누름의 연장으로
         // 오인하지 않도록 0/1 이 아니면 카운터를 중립으로 되돌린다 (N4와 같은 방어).
-        if (btn1 != 0 && btn1 != 1) { btn1_counter_ = 0; return; }
+        if ((btn1 != 0 && btn1 != 1) || (btn2 != 0 && btn2 != 1)) {
+            btn1_counter_ = 0; combo_seen_ = false; return;
+        }
+
+        // btn1+btn2 동시는 **AUTO 시나리오 전환**이다(2026-09-03). 조합을 3초 이상
+        // 붙들고 있어도 대기압 재영점이 튀어나오지 않게 막는다. 판정 규칙은 EKF 와
+        // 같다 — 상대 버튼이 한 번이라도 같이 눌리면 이번 누름은 조합이고, 래치는
+        // 둘 다 뗀 뒤에 풀린다.
+        if (btn1 == 1 && btn2 == 1) combo_seen_ = true;
 
         if (btn1 == 1) {
             btn1_counter_++;
-            if (btn1_counter_ == 300) btn1_long_press();   // >= 가 아니라 == : 1회만
+            if (btn1_counter_ == 300 && !combo_seen_) btn1_long_press();   // >= 가 아니라 == : 1회만
         } else {
             btn1_counter_ = 0;
         }
+
+        if (btn1 == 0 && btn2 == 0) combo_seen_ = false;
     }
 
     // ---- 파라미터 ----
@@ -1168,6 +1179,7 @@ private:
     double q_lpf_tau_, q_sigma_, q_deadband_n_, q_offset_max_, q_spread_max_, min_submerged_;
     double q_collect_timeout_;
     int    q_window_;
+    bool   combo_seen_ = false;   // btn1+btn2 동시 누름 래치 (재영점 억제용)
     double warmup_sec_, atm_spread_max_, atm_min_mbar_, atm_max_mbar_;
     double atm_zero_max_age_, q_zero_max_age_, press_timeout_;
     int    atm_window_;

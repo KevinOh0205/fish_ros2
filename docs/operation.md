@@ -16,6 +16,7 @@
 |---|---|---|
 | **btn1** | **AUTO / MANUAL 전환** | **대기압 영점 재포착** — 공기 중 전용, 잠기면 거부 |
 | **btn2** | **현재 방향을 yaw 0°로** (헤딩 영점) | **지자기 보정 시작** (텀블 필요; 한 번 더 3초 = 조기 종료) |
+| **btn1+btn2 동시** | **AUTO 시나리오 전환** (`straight` ↔ `dive`) | — |
 
 - **1초를 넘기고 3초가 안 되면 아무 일도 없다** — 짧지도 길지도 않은 구간은 무시된다.
 - 3초는 `== 300틱` 판정이라 계속 눌러도 한 번만 발동하고, 손을 뗄 때 짧은 누름으로 세지 않는다.
@@ -261,6 +262,31 @@ ros2 param set /pid_control_node servo_reverse_left true    # 또는 right/yaw, 
 | `turn` | **진입 시점 헤딩**에서 `angle_deg` 만큼 튼 헤딩을 목표로 전진 |
 | `porpoise` | 3초마다 피치 ±10° 왕복하며 전진 (`run_sec` 을 늘려 쓸 것) |
 | `attitude` | 추력 0 으로 피치 ±10° 왕복 — 벤치에서 서보만 볼 때 |
+
+#### 조종기로 전환 — **btn1+btn2 동시** (2026-09-03 실기 확인)
+
+물가에서 노트북 없이 시나리오를 바꾸는 방법이다. 두 버튼을 **같이** 눌렀다 떼면
+`combo_list`(기본 `straight,dive`)를 한 칸 돈다.
+
+```
+btn1+btn2 동시  →  시나리오 전환 (straight ↔ dive).  **모드는 바뀌지 않는다**
+btn1 단독       →  AUTO 진입 — 그때 걸려 있는 시나리오가 실행된다
+```
+
+조합으로 누르면 **양쪽의 단독 동작이 전부 억제된다** — 모드 토글, 헤딩 영점, 지자기 보정,
+대기압 재영점 어느 것도 발동하지 않는다. 누름 길이와 무관하며(빨리 누르든 2초를 누르든
+같다), 손 떼는 시점이 어긋나도 안전하다.
+
+⚠️ **지금 무엇이 걸려 있는지는 로봇을 봐서 알 수 없다.** 확인은 저널뿐이다:
+
+```
+[AUTO] 시나리오 전환 -> 'dive'  (2/2)  3.0초 추력 20% 각도 15.0도
+[AUTO SCENARIO] 시작! 'dive'  3.0초  추력 20%  진입 헤딩 5.7도
+```
+
+목록은 바꿀 수 있다: `ros2 param set /auto_scenario_node combo_list "straight,dive,turn"`
+
+#### 터미널로 전환
 
 ```bash
 ros2 param set /auto_scenario_node scenario dive    # straight/dive/climb/turn/porpoise/attitude

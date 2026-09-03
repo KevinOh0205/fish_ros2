@@ -237,6 +237,17 @@ Short press = 30 ms–1 s; long press = exactly 3 s (`== 300`, fires once).
 | btn1 | AUTO/MANUAL toggle | re-zero atmospheric pressure, **in air only** — refused above 5 mbar gauge (**handled by `hydro_estimator_node`** since 2026-08-21; the EKF still detects the 3 s hold, but only to suppress the release from counting as a short press). The in-water q zero is deliberately *not* on this button; call `/hydro/zero_q` for it |
 | btn2 | set current heading as yaw 0 | run `magneto_cal.py` (ellipsoid); long-press again = finish collection early (SIGINT) |
 
+**btn1+btn2 together = advance the AUTO scenario** (2026-09-03). While either button is held, if the
+other is down on any tick the press is latched as a *combo*: every single-button action is suppressed
+(mode toggle, heading zero, mag calibration, and `hydro_estimator_node`'s atmospheric re-zero) and the
+combo fires once, publishing `/ui/scenario_next`. `auto_scenario_node` steps through `combo_list`
+(default `straight,dive`) on that signal. **The latch clears only when BOTH are released** — the two
+releases were measured 0.1 s apart, and clearing on the first would let the later one fire its own
+action. Combo detection lives in `state_estimation_ekf_node` (which must suppress anyway) plus a
+small guard in `hydro_estimator_node`; don't scatter a third copy. The combo does **not** change mode —
+it only arms the scenario, which runs on the next plain btn1 entry. Simultaneous reporting by the
+transmitter/nRF was verified 2026-09-03 (3/3), and the whole path end to end the same day.
+
 When the RC link drops the nRF sends `btn = 255`; both `state_estimation_ekf_node` and
 `data_logger_node` explicitly reject non-0/1 values so the `1 → 255` transition isn't misread as a release.
 

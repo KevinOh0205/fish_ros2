@@ -95,6 +95,7 @@
 #include <geometry_msgs/msg/vector3.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include <Eigen/Dense>
@@ -237,6 +238,10 @@ public:
         load_mag_calibration_file();
 
         attitude_ekf_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/filtered/attitude_ekf", 10);
+        // btn1+btn2 동시 = AUTO 시나리오 전환. auto_scenario_node 가 받는다.
+        // 조합 판정을 여기 한 곳에서만 하는 이유: 단독 동작 억제가 어차피 이 노드의
+        // 일이라, 감지를 두 노드에 복제하면 규칙이 갈라진다(±5000 이 네 곳에 흩어진 전례).
+        scenario_next_pub_ = this->create_publisher<std_msgs::msg::Empty>("/ui/scenario_next", 10);
         status_pub_   = this->create_publisher<std_msgs::msg::Float32MultiArray>("/filtered/ekf_status", 10);
 
         imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
@@ -379,6 +384,14 @@ private:
     //   btn1 길게 : 대기압 영점 재수집
     //   btn2 짧게 : 현재 방향을 Yaw 0도로 (yaw_offset_ — /filtered/attitude 에만 적용)
     //   btn2 길게 : magneto_cal.py 실행 / 진행 중이면 SIGINT 조기 종료
+    //   **btn1+btn2 동시** : AUTO 시나리오 전환 (/ui/scenario_next 발행)
+    //
+    // 조합 규약 (2026-09-03): 누르고 있는 동안 상대 버튼이 **한 번이라도** 같이 눌리면
+    // 그 누름은 '조합'으로 확정되고, 양쪽의 단독 동작(모드 토글·헤딩 영점·지자기 보정)을
+    // 전부 억제한 뒤 조합 동작만 1회 실행한다. 래치는 **둘 다 뗀 뒤에** 풀린다 —
+    // 손을 떼는 시점이 어긋나도(실측 0.1초 차) 나중에 떼는 쪽이 단독 동작을 내지 않게
+    // 하기 위해서다. 누름 길이에 의존하지 않으므로 빨리 누르든 2초를 누르든 같다.
+    // (동시 인식 자체는 2026-09-03 실측 확인 — 3회 시도 전부 btn1=1,btn2=1 로 잡혔다)
     void rc_status_callback(const std_msgs::msg::Int32MultiArray::SharedPtr msg) {
         if (msg->data.size() < 2) return;
         const int32_t btn1 = msg->data[0];
@@ -393,6 +406,10 @@ private:
             return;
         }
 
+        // ── 조합 감지 ─────────────────────────────────────────────────────
+        // 둘이 같은 틱에 눌려 있으면 이번 누름은 조합으로 확정한다(래치).
+        if (btn1 == 1 && btn2 == 1) combo_seen_ = true;
+
         // 버튼 1
         if (btn1 == 1) {
             btn1_counter_++;
@@ -404,6 +421,9 @@ private:
             }
         } else {
             if (prev_btn1_ == 1) {   // Falling Edge = 손을 뗀 순간
+                if (combo_seen_) {
+                    fire_scenario_next();          // 조합 — 모드 토글은 하지 않는다
+                } else
                 // 30ms 이상 1초 미만이고 롱프레스로 처리되지 않았을 때만 짧은 누름
                 if (btn1_counter_ > 3 && btn1_counter_ < 100 && !btn1_long_processed_) {
                     is_auto_mode_ = !is_auto_mode_;
@@ -423,11 +443,17 @@ private:
             btn2_counter_++;
             if (btn2_counter_ == 300) {
                 btn2_long_processed_ = true;
-                // 시작/조기 종료/거절을 함수가 알아서 판단하고 로그를 남긴다
-                start_or_stop_mag_calibration(nullptr);
+                // 조합을 3초 이상 붙들고 있어도 지자기 보정이 튀어나오지 않게 막는다.
+                if (!combo_seen_) {
+                    // 시작/조기 종료/거절을 함수가 알아서 판단하고 로그를 남긴다
+                    start_or_stop_mag_calibration(nullptr);
+                }
             }
         } else {
             if (prev_btn2_ == 1) {
+                if (combo_seen_) {
+                    fire_scenario_next();          // 조합 — 헤딩 영점은 잡지 않는다
+                } else
                 if (btn2_counter_ > 3 && btn2_counter_ < 100 && !btn2_long_processed_) {
                     // 헤딩 영점: 현재 바라보는 방향을 Yaw 0도로 삼는다.
                     // 자북이 아니라 "출발 방향" 기준으로 조종하고 싶을 때 사용.
@@ -441,6 +467,21 @@ private:
             btn2_counter_ = 0; btn2_long_processed_ = false;
         }
         prev_btn2_ = btn2;
+
+        // 래치는 **둘 다 뗀 뒤에** 푼다. 먼저 뗀 쪽에서 풀면, 나중에 떼는 쪽이
+        // 자기 단독 동작을 내버린다 (실측: 두 버튼의 뗌이 0.1초 어긋났다).
+        if (btn1 == 0 && btn2 == 0) { combo_seen_ = false; combo_fired_ = false; }
+    }
+
+    // 조합 1회 발화 — 어느 쪽을 먼저 떼든 한 번만 나간다.
+    void fire_scenario_next() {
+        if (combo_fired_) return;
+        combo_fired_ = true;
+        scenario_next_pub_->publish(std_msgs::msg::Empty());
+        RCLCPP_WARN(this->get_logger(), "======================================================");
+        RCLCPP_WARN(this->get_logger(), "[EKF] 두 버튼 동시 — AUTO 시나리오 전환 신호를 보냈습니다.");
+        RCLCPP_WARN(this->get_logger(), "      (모드 토글·헤딩 영점은 이번 누름에서 억제됨)");
+        RCLCPP_WARN(this->get_logger(), "======================================================");
     }
 
     // =========================================================================
@@ -1411,6 +1452,9 @@ private:
     int  btn1_counter_; int btn2_counter_; // 눌림 지속 틱 (1틱 = 10ms)
     int  prev_btn1_; int prev_btn2_;       // 엣지 판정용 직전 상태
     bool btn1_long_processed_; bool btn2_long_processed_;
+    bool combo_seen_ = false;              // 이번 누름이 조합으로 확정됐는가
+    bool combo_fired_ = false;             // 조합 동작을 이미 1회 실행했는가
+    rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr scenario_next_pub_;
 
     // ---- yaw 영점 (btn2 짧게) ----
     float raw_yaw_;      // 헤딩 영점 적용 전 원시 yaw [도] — publish()에서 매 샘플 갱신
