@@ -244,18 +244,43 @@ ros2 param set /pid_control_node servo_reverse_left true    # 또는 right/yaw, 
 
 ### 4.3 AUTO 모드 (🎮 btn1 짧게)
 
-현재 시나리오(2026-09-03): **수평 자세로 추력 20 %(PWM 1200), 3초 전진 후 정지.**
+기본 시나리오(2026-09-03): **수평 자세로 추력 20 %(PWM 1200), 3초 전진 후 정지.**
 자세는 전 구간 roll/pitch/yaw 0°를 지시하고, 3초가 지나면 추력만 1000으로 끊는다.
 **다시 달리려면 btn1 으로 MANUAL 로 나갔다가 AUTO 로 재진입**한다(진입 순간 스톱워치가
 0으로 리셋된다). 종전의 6초 주기 피치 ±10° 왕복은 물속 첫 검증을 위해 걷어냈다 —
 자세를 흔들면 추력 문제인지 자세 문제인지 가릴 수 없기 때문이다.
+**직진 시나리오는 실기로 확인됨 (2026-09-03, 운용자).**
 
-시간과 추력은 파라미터라 재빌드 없이 바꾼다(달리는 중에도 즉시 반영):
+#### 시나리오 목록과 교체
+
+| 이름 | 동작 |
+|---|---|
+| `straight` (기본) | 수평 직진 |
+| `dive` | 코를 `angle_deg` 만큼 **아래로** 하고 전진 (이 로봇은 양수 피치 = 코 아래) |
+| `climb` | 코를 `angle_deg` 만큼 위로 하고 전진 |
+| `turn` | **진입 시점 헤딩**에서 `angle_deg` 만큼 튼 헤딩을 목표로 전진 |
+| `porpoise` | 3초마다 피치 ±10° 왕복하며 전진 (`run_sec` 을 늘려 쓸 것) |
+| `attitude` | 추력 0 으로 피치 ±10° 왕복 — 벤치에서 서보만 볼 때 |
 
 ```bash
+ros2 param set /auto_scenario_node scenario dive    # straight/dive/climb/turn/porpoise/attitude
 ros2 param set /auto_scenario_node run_sec 5.0
 ros2 param set /auto_scenario_node throttle_pct 30.0
+ros2 param set /auto_scenario_node angle_deg 15.0
+# 그 다음 btn1 으로 MANUAL 로 나갔다가 AUTO 재진입
 ```
+
+**바뀐 값은 다음 AUTO 진입부터 적용된다.** 진입 순간에 설정이 통째로 잠기므로, 달리는
+중에 파라미터를 바꿔도 그 주행은 진입 때 값으로 끝까지 간다 — 사후에 "무엇을 지시했나"가
+한 값으로 확정되게 하기 위해서다. 진입하면 저널에 이렇게 찍힌다:
+
+```
+[AUTO SCENARIO] 시작! 'dive'  5.0초  추력 20%  진입 헤딩 12.3도
+```
+
+파라미터는 **재시작하면 사라진다**(기본값으로 복귀). 고정하려면 소스 기본값을 바꿀 것.
+`turn` 의 한계: PID 의 요 오차가 `target - robot` 이라 **±180 경계를 감싸지 않는다** —
+진입 헤딩이 ±180 부근이면 먼 쪽으로 돌 수 있다.
 
 ⚠️ **진입 즉시 추력이 걸린다** — 물 밖에서 실수로 누르면 꼬리가 3초간 20 %로 돈다.
 ESC 는 정상 동작이 확인된 부품이므로 **모터 전원이 붙어 있으면 정말로 돈다** —
