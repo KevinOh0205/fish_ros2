@@ -7,10 +7,11 @@
 #   ※ I2C 버스를 독점하므로 먼저 시스템을 내릴 것:
 #        sudo systemctl stop fish-robot
 #
-# 세 단계를 따로 판정한다. 앞 단계가 통과해도 뒤 단계에서 떨어질 수 있다:
+# 네 단계를 따로 판정한다. 앞 단계가 통과해도 뒤 단계에서 떨어질 수 있다:
 #   1) 채널 전기 상태 — 그 채널을 열었을 때 버스가 살아있는가
 #   2) 센서 응답·PROM — 리셋에 답하는가, 보정 계수가 온전한가 (CRC 검증)
 #   3) **ADC 변환**    — 실제로 압력을 뽑아내는가, 그 값이 대기압 범위인가
+#   4) **배정 대조**   — config/port_map.txt 에 적힌 개체가 지금 그 자리에 있는가
 #
 # 3)이 왜 필요한가 (2026-09-04에 두 개체에서 실측):
 #   리셋(0x1E)도 받고 PROM도 CRC까지 맞게 읽히는데 **변환 명령(0x40~0x4A)만
@@ -18,6 +19,11 @@
 #   압력은 한 샘플도 안 나온다. 게다가 i2c_driver_node 의 실패 ERROR 는
 #   **전 채널이 죽었을 때만** 뜨므로(i2c_driver_node.cpp 의 press_fail_streak_),
 #   셋 중 하나만 이러면 저널에 아무 흔적도 남지 않는다. 이 단계가 그 사각지대다.
+#
+# 4)를 도구가 하는 이유: 지문을 숫자로만 찍으면 사람이 port_map.txt 를 열어 눈으로
+#   대조해야 한다. 센서를 자주 바꿔 끼우는 선별 작업에서 그게 제일 헷갈리는 지점이다.
+#   ※ 지문은 C1~C6 여섯 개를 다 본다. C1 은 일련번호가 아니라 보정 계수라 유일성이
+#     보장되지 않고, i2c_driver_node 의 판정 기준도 여섯 개 전부다 — 기준을 맞춰 둔다.
 #
 # ※ 탐지는 반드시 "쓰기"(리셋 0x1E)로 한다. MS5837은 선행 명령 없이 읽으면
 #   응답하지 않아, i2cdetect/i2cget 으로는 멀쩡한 센서도 못 찾는다.
@@ -109,6 +115,54 @@ def convert_02ba(C, d1, d2):
     return p / 100.0, temp / 100.0
 
 
+def load_port_map():
+    """config/port_map.txt 를 읽어 (verified, {ch: (역할, [C1..C6])}) 를 돌려준다.
+
+    i2c_driver_node::verify_port_map() 과 같은 파일·같은 형식을 읽는다.
+    파일이 없으면 (None, {}) — 교체 직후 지운 상태가 정상적인 경우다.
+    """
+    home = os.environ.get('HOME')
+    path = os.path.join(home, 'ros2_ws/config/port_map.txt') if home else 'config/port_map.txt'
+    if not os.path.exists(path):
+        return None, {}
+    verified, rows = False, {}
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            # "verified:" 뒤 **첫 토큰만** 본다. 줄 안에 'yes' 가 있는지로 보면
+            # 안내문("... 후 yes 로 바꾸십시오")이 자기 자신을 통과시킨다
+            # (2026-08-25 에 드라이버에서 실제로 났던 사고).
+            vp = line.find('verified:')
+            if vp != -1:
+                tok = line[vp + 9:].split()
+                if tok:
+                    verified = (tok[0] == 'yes')
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            f7 = line.split()
+            if len(f7) < 8:
+                continue
+            try:
+                ch = int(f7[1])
+                coef = [int(x) for x in f7[2:8]]
+            except ValueError:
+                continue
+            if 0 <= ch <= 2:
+                rows[ch] = (f7[0], coef)
+    return verified, rows
+
+
+def match_port_map(ch, prom, rows):
+    """이 자리의 개체가 파일과 같은지 판정해 사람이 읽을 한 줄로 돌려준다."""
+    if not rows:
+        return f"C1={prom[1]} (배정 파일 없음 — 확정 전)"
+    if ch not in rows:
+        return f"C1={prom[1]} **파일에 없던 채널** — 새로 꽂은 자리"
+    role, coef = rows[ch]
+    if list(prom[1:7]) == coef:
+        return f"{role} 지문일치"
+    return f"**{role} 자리 개체 교체됨** (파일 C1={coef[0]} -> 실제 C1={prom[1]})"
+
+
 def probe_adc(fd, C, tries):
     """ADC 변환을 tries 회 시도하고 (상태, 비고) 를 돌려준다."""
     ok, fails, press, temps = 0, {}, [], []
@@ -156,7 +210,16 @@ def main():
         print(" 먹스(0x70) 무응답 — 버스가 잠겼습니다.")
         print(" -> 전원을 완전히 내렸다 올린 뒤 다시 실행하세요 (재부팅으로는 안 풀립니다).")
         return 1
-    print(" 먹스 응답 정상\n")
+    print(" 먹스 응답 정상")
+
+    verified, pmap = load_port_map()
+    if not pmap:
+        print(" 배정 파일 없음 — 지문 대조를 건너뜁니다 (기동하면 지금 상태로 새로 만들어집니다)")
+    elif verified:
+        print(" 배정 파일: 물리 확인 완료(verified: yes) — 아래 지문이 이 배정의 근거입니다")
+    else:
+        print(" 배정 파일: **물리 확인 전(verified: no)** — 역할은 추정값입니다. 바람 시험을 하십시오")
+    print()
 
     results = []
     for ch in range(3):
@@ -204,8 +267,8 @@ def main():
                 state, note = probe_adc(fd, prom, knocks)
                 if state == '정상' and hit < knocks:
                     state = f"접촉 불안정 {hit}/{knocks}"
-                # 개체 식별용 지문. port_map.txt 의 C1 과 대조한다.
-                note = f"C1={prom[1]}, " + note
+                # 대조는 도구가 한다 — 사람이 파일을 열어 숫자를 눈으로 맞추지 않게.
+                note = match_port_map(ch, prom, pmap) + ", " + note
                 results.append((name, "정상", state, note))
 
         talk(fd, MUX, [0x00])
@@ -221,6 +284,14 @@ def main():
 
     # 해석 안내
     states = [r[2] for r in results]
+    notes = [r[3] for r in results]
+    if any("교체됨" in n or "파일에 없던" in n for n in notes):
+        print(" **지금 꽂힌 개체가 배정 파일과 다릅니다.** 의도한 교체라면 파일을 지우고")
+        print(" 시스템을 한 번 띄우면 지금 상태로 새로 만들어집니다(verified: no 로 적힙니다):")
+        print("   rm ~/ros2_ws/config/port_map.txt")
+        print(" 그 다음 **바람 시험**으로 앞/좌/우를 다시 확정하고 verified 를 yes 로 바꾸십시오 —")
+        print(" 지문이 맞아도 그건 '개체가 그 자리에 있다'는 뜻일 뿐, 튜브가 어디로 가는지는 모릅니다.")
+        print()
     if any("ADC" in s or s == "값 이상" for s in states):
         print(" **PROM은 멀쩡한데 ADC가 죽은 채널이 있습니다.** 이 고장은 저널에 흔적을")
         print(" 남기지 않습니다(전 채널이 죽어야 ERROR가 뜹니다) — 압력만 조용히 NaN이 됩니다.")
