@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
-# 먹스 채널 상태와 압력 센서 연결 상태를 분리해서 진단한다.
+# 먹스 채널·압력 센서를 단계별로 분리해서 진단한다.
 #
-#   python3 ~/mux_probe.py            기본 (채널당 5회 두드림)
-#   python3 ~/mux_probe.py 20         채널당 20회 (접촉 불량 잡을 때)
+#   python3 ~/ros2_ws/src/fish_robot_pkg/scripts/mux_probe.py       기본 (채널당 5회)
+#   python3 ... mux_probe.py 20                                     채널당 20회 (접촉 불량 잡을 때)
 #
-# 두 가지를 따로 판정한다:
+#   ※ I2C 버스를 독점하므로 먼저 시스템을 내릴 것:
+#        sudo systemctl stop fish-robot
+#
+# 세 단계를 따로 판정한다. 앞 단계가 통과해도 뒤 단계에서 떨어질 수 있다:
 #   1) 채널 전기 상태 — 그 채널을 열었을 때 버스가 살아있는가
-#   2) 센서 상태      — 센서가 응답하는가, PROM이 온전한가 (CRC 검증)
+#   2) 센서 응답·PROM — 리셋에 답하는가, 보정 계수가 온전한가 (CRC 검증)
+#   3) **ADC 변환**    — 실제로 압력을 뽑아내는가, 그 값이 대기압 범위인가
+#
+# 3)이 왜 필요한가 (2026-09-04에 두 개체에서 실측):
+#   리셋(0x1E)도 받고 PROM도 CRC까지 맞게 읽히는데 **변환 명령(0x40~0x4A)만
+#   전 OSR에서 NACK** 되는 고장이 있다. 2)까지만 보면 "정상"으로 나오지만
+#   압력은 한 샘플도 안 나온다. 게다가 i2c_driver_node 의 실패 ERROR 는
+#   **전 채널이 죽었을 때만** 뜨므로(i2c_driver_node.cpp 의 press_fail_streak_),
+#   셋 중 하나만 이러면 저널에 아무 흔적도 남지 않는다. 이 단계가 그 사각지대다.
 #
 # ※ 탐지는 반드시 "쓰기"(리셋 0x1E)로 한다. MS5837은 선행 명령 없이 읽으면
 #   응답하지 않아, i2cdetect/i2cget 으로는 멀쩡한 센서도 못 찾는다.
@@ -15,6 +26,9 @@ import fcntl, os, sys, time
 
 I2C_SLAVE = 0x0703
 BUS, MUX, SENS = '/dev/i2c-1', 0x70, 0x76
+
+D1_CMD, D2_CMD = 0x4A, 0x5A   # 압력/온도 변환, OSR=8192 — i2c_driver_node 와 같은 설정
+OSR_WAIT = 0.025              # 데이터시트 최대 18ms + 여유
 
 
 def talk(fd, addr, wr=None, rd=0):
@@ -51,13 +65,92 @@ def read_prom(fd):
     return words
 
 
+def read_adc(fd, cmd):
+    """변환 명령 -> 대기 -> 24비트 회수. (값, 실패사유). 값이 None이면 사유를 본다.
+
+    'nack'    변환 명령 자체를 거부 — ADC 사망 (PROM은 멀쩡해도 이럴 수 있다)
+    'read'    변환은 받았는데 결과 회수 실패
+    'zero'    0 또는 0xFFFFFF — 미수거/통신 실패. 드라이버도 이 둘을 버린다
+    """
+    if talk(fd, SENS, [cmd]) is None:
+        return None, 'nack'
+    time.sleep(OSR_WAIT)
+    b = talk(fd, SENS, [0x00], 3)
+    if b is None or len(b) != 3:
+        return None, 'read'
+    v = (b[0] << 16) | (b[1] << 8) | b[2]
+    if v in (0, 0xFFFFFF):
+        return None, 'zero'
+    return v, None
+
+
+def idiv(a, b):
+    """C 의 정수 나눗셈(0 쪽으로 절단). 파이썬 // 는 내림이라 음수에서 1 LSB 어긋난다."""
+    q = abs(a) // abs(b)
+    return q if (a < 0) == (b < 0) else -q
+
+
+def convert_02ba(C, d1, d2):
+    """MS5837-**02BA** 환산식. i2c_driver_node.cpp 와 같은 식이어야 한다. -> (mbar, °C)
+
+    ※ 30BA 식을 쓰면 정확히 20배 어긋난 값이 나온다(2026-08-20 실측:
+      30BA 식 20132.60 vs 02BA 식 1006.63). 아래 '대기압 범위' 판정이 그걸 잡는다.
+    """
+    dT = d2 - C[5] * 256
+    temp = 2000 + idiv(dT * C[6], 8388608)
+    off = C[2] * 131072 + idiv(C[4] * dT, 64)
+    sens = C[1] * 65536 + idiv(C[3] * dT, 128)
+    if temp < 2000:                                   # 2차 보상 — 20°C 미만에서만 발동
+        d2sq = (temp - 2000) ** 2
+        temp -= idiv(11 * dT * dT, 17179869184)
+        off -= idiv(31 * d2sq, 8)
+        sens -= idiv(63 * d2sq, 32)
+    p = idiv(idiv(d1 * sens, 2097152) - off, 32768)
+    return p / 100.0, temp / 100.0
+
+
+def probe_adc(fd, C, tries):
+    """ADC 변환을 tries 회 시도하고 (상태, 비고) 를 돌려준다."""
+    ok, fails, press, temps = 0, {}, [], []
+    for _ in range(tries):
+        d1, why = read_adc(fd, D1_CMD)
+        if d1 is None:
+            fails[why] = fails.get(why, 0) + 1
+            continue
+        d2, why = read_adc(fd, D2_CMD)
+        if d2 is None:
+            fails[why] = fails.get(why, 0) + 1
+            continue
+        p, t = convert_02ba(C, d1, d2)
+        ok += 1
+        press.append(p)
+        temps.append(t)
+
+    if ok == 0:
+        if fails.get('nack'):
+            return 'ADC 사망', (f"PROM은 정상인데 변환명령을 {fails['nack']}/{tries} 거부 "
+                              "— 개체 불량, 교체 대상")
+        return 'ADC 무응답', f"변환 결과를 못 받음 ({fails}) — 배선/접촉 확인"
+
+    avg = sum(press) / len(press)
+    span = max(press) - min(press)
+    note = f"{avg:.2f} mbar {sum(temps)/len(temps):.1f}°C (폭 {span:.2f}), ADC {ok}/{tries}"
+    if not (300.0 <= avg <= 1200.0):
+        # 공기 중 대기압은 어디서든 300~1200mbar 안이다. 벗어나면 센서 고장이거나
+        # 환산식이 모델과 안 맞는 것(30BA/02BA 혼동 = 정확히 20배).
+        return '값 이상', note + " — 대기압 범위(300~1200) 밖. 센서 모델/환산식 확인"
+    if ok < tries:
+        return f'ADC 불안정 {ok}/{tries}', note
+    return '정상', note
+
+
 def main():
     knocks = int(sys.argv[1]) if len(sys.argv) > 1 else 5
     fd = os.open(BUS, os.O_RDWR)
 
-    print("=" * 70)
-    print(f" 먹스·압력센서 진단  (채널당 {knocks}회 두드림)")
-    print("=" * 70)
+    print("=" * 78)
+    print(f" 먹스·압력센서 진단  (채널당 {knocks}회)")
+    print("=" * 78)
 
     if talk(fd, MUX, rd=1) is None:
         print(" 먹스(0x70) 무응답 — 버스가 잠겼습니다.")
@@ -98,19 +191,22 @@ def main():
             time.sleep(0.02)
             prom = read_prom(fd)
             if prom is None:
-                note = "주소는 응답하나 PROM 읽기 실패"
-                state = f"불안정 {hit}/{knocks}"
+                results.append((name, "정상", f"불안정 {hit}/{knocks}",
+                                "주소는 응답하나 PROM 읽기 실패"))
             elif any(w in (0x0000, 0xFFFF) for w in prom):
-                note = "PROM에 0/FFFF 포함 — 통신 불량"
-                state = f"불안정 {hit}/{knocks}"
+                results.append((name, "정상", f"불안정 {hit}/{knocks}",
+                                "PROM에 0/FFFF 포함 — 통신 불량"))
             elif crc4(prom) != (prom[0] >> 12):
-                note = f"PROM CRC 불일치 (계산 {crc4(prom)}, 저장 {prom[0] >> 12})"
-                state = f"불안정 {hit}/{knocks}"
+                results.append((name, "정상", f"불안정 {hit}/{knocks}",
+                                f"PROM CRC 불일치 (계산 {crc4(prom)}, 저장 {prom[0] >> 12})"))
             else:
-                ver = (prom[0] >> 5) & 0x7F
-                note = f"PROM 정상 (CRC OK, 버전비트 {ver:07b})"
-                state = "정상" if hit == knocks else f"접촉 불안정 {hit}/{knocks}"
-            results.append((name, "정상", state, note))
+                # --- 3) ADC 변환 — 여기까지 와야 "정상"이라고 부를 수 있다 ---
+                state, note = probe_adc(fd, prom, knocks)
+                if state == '정상' and hit < knocks:
+                    state = f"접촉 불안정 {hit}/{knocks}"
+                # 개체 식별용 지문. port_map.txt 의 C1 과 대조한다.
+                note = f"C1={prom[1]}, " + note
+                results.append((name, "정상", state, note))
 
         talk(fd, MUX, [0x00])
 
@@ -118,14 +214,19 @@ def main():
     os.close(fd)
 
     print(f" {'채널':<12}{'채널 상태':<16}{'센서 상태':<18}비고")
-    print(" " + "-" * 68)
+    print(" " + "-" * 76)
     for r in results:
         print(f" {r[0]:<12}{r[1]:<16}{r[2]:<18}{r[3]}")
-    print("=" * 70)
+    print("=" * 78)
 
     # 해석 안내
     states = [r[2] for r in results]
-    if any("불안정" in s for s in states):
+    if any("ADC" in s or s == "값 이상" for s in states):
+        print(" **PROM은 멀쩡한데 ADC가 죽은 채널이 있습니다.** 이 고장은 저널에 흔적을")
+        print(" 남기지 않습니다(전 채널이 죽어야 ERROR가 뜹니다) — 압력만 조용히 NaN이 됩니다.")
+        print(" 센서와 커넥터 중 어느 쪽인지는 **정상 채널과 서로 바꿔 꽂고** 다시 재면 갈립니다.")
+        print("   고장이 커넥터를 따라가면 -> 배선,  개체를 따라가면 -> 센서 폐기.")
+    elif any("불안정" in s for s in states):
         print(" 접촉 불안정이 있습니다. `bash ~/press_watch.sh` 를 띄워두고 커넥터를")
         print(" 눌러보거나 케이블을 흔들어 어느 자세에서 붙는지 찾으세요.")
     elif any(r[1] == "버스 사망" for r in results):
@@ -135,7 +236,8 @@ def main():
         print(" 센서가 하나도 응답하지 않습니다. 커넥터의 VCC 전압(3.3V)과")
         print(" SDA/SCL 핀 순서를 먼저 확인하세요.")
     elif any(s == "정상" for s in states):
-        print(" 정상인 채널이 있습니다. 그대로 측정에 들어가도 됩니다.")
+        print(" 압력까지 확인된 채널이 있습니다. 그대로 측정에 들어가도 됩니다.")
+        print(" (수심은 좌·우 두 정압 포트가 **둘 다** 살아야 나옵니다. 노즈만으로는 안 됩니다.)")
     return 0
 
 

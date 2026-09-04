@@ -88,7 +88,7 @@ public:
     {
         // ── 파라미터 (기본값의 진실원은 여기 한 곳) ────────────────────────
         scenario_     = this->declare_parameter<std::string>("scenario", "straight");
-        run_sec_      = this->declare_parameter<double>("run_sec", 3.0);
+        run_sec_      = this->declare_parameter<double>("run_sec", 8.0);
         throttle_pct_ = this->declare_parameter<double>("throttle_pct", 20.0);
         angle_deg_    = this->declare_parameter<double>("angle_deg", 15.0);
         combo_list_   = parse_list(this->declare_parameter<std::string>("combo_list", "straight,dive"));

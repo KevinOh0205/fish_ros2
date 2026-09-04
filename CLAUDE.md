@@ -193,8 +193,15 @@ upper clamp (covariance adjusts trust). §1.3.
   thresholds are designed around the **raw** σ (0.189 mbar), and destroy the raw CSV record that
   post-hoc analysis depends on (the 8–15× noise discovery required the bypass). Consumers filter
   for themselves; a future depth loop picks its own coefficient in its own node.
-- A dead pressure channel is marked by `prom_C_[i][1] == 0` and reported downstream as `0.0`; the
-  estimator treats `< 100 mbar` as invalid.
+- A pressure channel that fails at **PROM load** is marked `prom_C_[i][1] == 0` and skipped
+  entirely; its slot publishes NaN (not `0.0` — see §3). But **PROM success does not mean the
+  sensor works**: two units (C1 42722 on 2026-09-02, C1 43114 on 2026-09-04) answered reset and
+  returned a CRC-valid PROM while **NACKing every ADC conversion command (0x40–0x4A) at every
+  OSR**. That channel publishes NaN with **no journal trace at all**, because
+  `i2c_driver_node`'s failure ERROR only fires when *all three* channels fail
+  (`press_fail_streak_`). `mux_probe.py` used to call this "정상"; since 2026-09-04 it runs a
+  third stage that converts an actual pressure, and reports `ADC 사망`. Sensor vs connector is
+  settled by swapping the suspect into a known-good channel.
 - `SERVO_MIN_US`/`SERVO_MAX_US` (1325/1675 since 2026-08-26 — horn ≈ ±20° on the HS-5086WP's
   0.114°/µs) in `pid_control_node.cpp` **must stay inside the nRF firmware's `MotorControl.cpp`
   window (1250/1750)** — narrower here is safe (the nRF clamp never triggers); wider is not.
