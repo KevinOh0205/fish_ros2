@@ -53,8 +53,27 @@ public:
                        // 같은 PWM 증가가 물리적으로 반대 회전이 된다. 실측(2026-08-26):
                        // 피치 명령에 좌우가 반대로 돌고(=물리 롤), 롤 명령에 같이 돌았다
                        // (=물리 피치) — 명령의 자세↔서보 상관은 정상(−0.93/−0.96)이었으므로
-                       // 원인은 믹싱이 아니라 장착 방향. 우측 편향만 반전한다.
+                       // 원인은 믹싱이 아니라 장착 방향이다.
+                       //
+                       // 2026-09-04 벤치에서 PID·스틱을 빼고 /motor/output 에 고정 PWM 을
+                       // 직접 꽂아 확인했다: **좌우에 같은 PWM(1675)을 주면 지느러미가
+                       // 서로 반대로 벌어진다** = 거울상 장착이 맞다. 따라서 피치(지느러미
+                       // 같은 방향)를 내려면 PWM 은 반대여야 하고, 우측만 반전이 옳다.
+                       //
+                       // 같은 날 이 값을 false 로 잠깐 뒤집었다가 AUTO 시나리오 2(피치 다운)
+                       // 에서 양쪽이 반대로 벌어져 되돌렸다. **수동에서 보이던 이상은 이
+                       // 값이 아니라 스틱 롤/피치 스왑이 원인이었다** (swap_rc_rp_ 참조) —
+                       // 수동만 보고 이 값을 만지면 AUTO 가 깨진다. 판정은 AUTO 로 할 것.
                        servo_rev_l_(false), servo_rev_r_(true), servo_rev_y_(false),
+                       // 축 부호. 피치는 IMU 규약이 항공과 반대(양수 pitch = 기수 아래)라
+                       // 뒤집힐 소지가 상시 있다 — 벤치에서 지느러미를 보고 확정할 것.
+                       invert_pitch_(false), invert_roll_(false),
+                       // 조종기 짐벌 배선 스왑을 파이에서 우회하던 스위치. 조종기 펌웨어를
+                       // 고쳤으므로(2026-09-04) 기본값은 false 다 — 켜 두면 두 번 뒤집혀 원위치.
+                       swap_rc_rp_(false),
+                       // 스틱 부호. 조종기가 스틱 다운에 음수를 보내는데 이 IMU 규약은
+                       // 양수가 기수 아래라, 피치만 뒤집어야 다운이 다운이 된다.
+                       rc_inv_roll_(false), rc_inv_pitch_(true),
                        // 스틱 데드밴드: 실측(45초 정지)에서 roll 스틱이 중립인데 −12까지
                        // 방황했고(트림 오프셋+잡음), 스로틀이 0→28 스파이크를 냈다.
                        rc_deadband_(15), throttle_deadband_(40),
@@ -87,6 +106,12 @@ public:
         servo_rev_l_ = this->declare_parameter<bool>("servo_reverse_left",  servo_rev_l_);
         servo_rev_r_ = this->declare_parameter<bool>("servo_reverse_right", servo_rev_r_);
         servo_rev_y_ = this->declare_parameter<bool>("servo_reverse_yaw",   servo_rev_y_);
+        // 축 부호 — 서보 반전과 목적이 다르다. 믹싱 주석의 1)/2) 구분을 볼 것.
+        invert_pitch_ = this->declare_parameter<bool>("invert_pitch", invert_pitch_);
+        invert_roll_  = this->declare_parameter<bool>("invert_roll",  invert_roll_);
+        swap_rc_rp_   = this->declare_parameter<bool>("swap_rc_roll_pitch", swap_rc_rp_);
+        rc_inv_roll_  = this->declare_parameter<bool>("invert_rc_roll",  rc_inv_roll_);
+        rc_inv_pitch_ = this->declare_parameter<bool>("invert_rc_pitch", rc_inv_pitch_);
         rc_deadband_       = (int)this->declare_parameter<int64_t>("rc_deadband",       rc_deadband_);
         throttle_deadband_ = (int)this->declare_parameter<int64_t>("throttle_deadband", throttle_deadband_);
 
@@ -101,6 +126,14 @@ public:
         RCLCPP_INFO(this->get_logger(),
             "=== [PID Control] 서보 반전: 좌 %d / 우 %d / 요 %d  스틱 데드밴드: rpy %d, 스로틀 %d ===",
             servo_rev_l_, servo_rev_r_, servo_rev_y_, rc_deadband_, throttle_deadband_);
+        RCLCPP_INFO(this->get_logger(),
+            "=== [PID Control] 축 부호 반전: 피치 %d / 롤 %d  (서보 반전과 다른 것 — 축 하나만 뒤집는다) ===",
+            invert_pitch_, invert_roll_);
+        RCLCPP_INFO(this->get_logger(),
+            "=== [PID Control] 수동 스틱 롤<->피치 스왑: %d  (AUTO 경로에는 영향 없음) ===", swap_rc_rp_);
+        RCLCPP_INFO(this->get_logger(),
+            "=== [PID Control] 수동 스틱 부호 반전: 롤 %d / 피치 %d  (AUTO 는 규약이 달라 제외) ===",
+            rc_inv_roll_, rc_inv_pitch_);
         RCLCPP_INFO(this->get_logger(),
             "=== [PID Control] 런타임 튜닝: ros2 param set /pid_control_node kp_pitch <값> ===");
 
@@ -147,8 +180,30 @@ private:
         // -> 마지막 정상 수신 시각이 멈추므로 아래 failsafe_timeout_ 검사에 걸린다.
         int16_t incoming_throttle = static_cast<int16_t>(msg->w);
         if (incoming_throttle != -9999) {
-            rc_roll_ = static_cast<int16_t>(msg->x);
-            rc_pitch_ = static_cast<int16_t>(msg->y);
+            // **스틱 축 스왑 우회 스위치. 지금은 꺼져 있는 것이 정상이다.**
+            //
+            // 2026-09-04 실측: 조종기 스틱을 가로로만 흔들면 /rc/command 의 y(피치)가,
+            // 세로로만 흔들면 x(롤)가 움직였다 — 조종기 짐벌 배선이 뒤바뀌어 있었다
+            // (세로축 포텐쇼미터가 roll_pin 에). 그래서 피치 스틱이 롤 명령이 되어
+            // "피치를 주는데 지느러미가 롤처럼 반대로 움직인다" 가 나왔다.
+            //
+            // **근본 수정은 조종기 펌웨어에서 했다** (Input_Manager.cpp 의 roll_pin/
+            // pitch_pin #define 교체, 2026-09-04). 그래서 이 스위치는 false 다.
+            // 조종기를 고친 채로 이걸 켜면 두 번 뒤집혀 다시 망가진다.
+            //
+            // ※ 이건 **수동 경로만**의 문제였다. AUTO 는 /auto/command 로 따로 오므로
+            //   영향이 없다 — 그래서 서보 반전으로 수동을 맞추면 AUTO 가 틀어지고,
+            //   AUTO 를 맞추면 수동이 틀어지는 모순이 생겼다. 두 문제가 겹쳐 서로를
+            //   가리고 있었던 것이다(다른 하나는 servo_rev_r_ 주석 참조).
+            // ※ /rc/command 원시값은 건드리지 않는다 — 로깅·진단이 원본을 봐야 한다.
+            //   그래서 이 스위치를 켜면 CSV 의 RC_R/RC_P 열은 뒤바뀐 채로 남는다.
+            if (swap_rc_rp_) {
+                rc_roll_  = static_cast<int16_t>(msg->y);
+                rc_pitch_ = static_cast<int16_t>(msg->x);
+            } else {
+                rc_roll_  = static_cast<int16_t>(msg->x);
+                rc_pitch_ = static_cast<int16_t>(msg->y);
+            }
             rc_yaw_ = static_cast<int16_t>(msg->z);
             rc_throttle_ = incoming_throttle;
             last_valid_rc_time_ = this->now();
@@ -178,6 +233,11 @@ private:
             if (n == "servo_reverse_left")  { servo_rev_l_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 서보 반전 변경: 좌 = %d", servo_rev_l_); continue; }
             if (n == "servo_reverse_right") { servo_rev_r_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 서보 반전 변경: 우 = %d", servo_rev_r_); continue; }
             if (n == "servo_reverse_yaw")   { servo_rev_y_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 서보 반전 변경: 요 = %d", servo_rev_y_); continue; }
+            if (n == "invert_pitch")        { invert_pitch_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 축 부호 변경: 피치 반전 = %d", invert_pitch_); continue; }
+            if (n == "invert_roll")         { invert_roll_  = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 축 부호 변경: 롤 반전 = %d",  invert_roll_);  continue; }
+            if (n == "swap_rc_roll_pitch")  { swap_rc_rp_   = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 수동 스틱 롤<->피치 스왑 = %d", swap_rc_rp_); continue; }
+            if (n == "invert_rc_roll")      { rc_inv_roll_  = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 수동 스틱 부호: 롤 반전 = %d",  rc_inv_roll_);  continue; }
+            if (n == "invert_rc_pitch")     { rc_inv_pitch_ = prm.as_bool(); RCLCPP_WARN(this->get_logger(), "[PID Control] 수동 스틱 부호: 피치 반전 = %d", rc_inv_pitch_); continue; }
             if (n == "rc_deadband")       { rc_deadband_       = (int)prm.as_int(); RCLCPP_WARN(this->get_logger(), "[PID Control] rc_deadband = %d", rc_deadband_); continue; }
             if (n == "throttle_deadband") { throttle_deadband_ = (int)prm.as_int(); RCLCPP_WARN(this->get_logger(), "[PID Control] throttle_deadband = %d", throttle_deadband_); continue; }
             const float v = (float)prm.as_double();
@@ -259,8 +319,18 @@ private:
                 if (st < -rc_deadband_) return (int16_t)(st + rc_deadband_);
                 return 0;
             };
-            target_roll  = soft_db(rc_roll_)  * 0.1f;
-            target_pitch = soft_db(rc_pitch_) * 0.1f;
+            // **스틱 부호 — MANUAL 에만 건다. AUTO 와 규약이 다르기 때문이다.**
+            //
+            // 이 IMU 는 **양수 pitch = 기수 아래**다(항공 규약 반대, 실측 확정).
+            // AUTO 시나리오는 그 규약대로 쓰여 있다 — dive 가 pitch = +angle 이다.
+            // 반면 조종기는 스틱을 내리면 −256 이 나온다. 그대로 목표각으로 쓰면
+            // "다운을 줬는데 기수가 올라간다" 가 된다 (2026-09-04 실기 확인).
+            //
+            // 그래서 뒤집는 자리는 여기, 수동 분기다. 축 부호(invert_pitch_)나
+            // 서보 반전으로 고치면 **AUTO 까지 같이 뒤집혀** 멀쩡한 시나리오가 깨진다.
+            // 근본 수정은 조종기의 map() 방향이고, 그쪽을 고치면 이 값을 false 로.
+            target_roll  = (rc_inv_roll_  ? -1.0f : 1.0f) * soft_db(rc_roll_)  * 0.1f;
+            target_pitch = (rc_inv_pitch_ ? -1.0f : 1.0f) * soft_db(rc_pitch_) * 0.1f;
             target_yaw   = soft_db(rc_yaw_)   * 0.1f;
             // 스로틀은 하드 데드밴드: "의도적 입력 전까지 ESC 는 정확히 1000" 이라는
             // 안전 속성이 연속성보다 중요하다. −9999 센티넬은 위 페일세이프가 이미
@@ -326,12 +396,26 @@ private:
         // 좌우 가슴지느러미 서보를 차동 구동한다:
         //   두 서보를 같은 방향으로 움직이면 -> 피치(상승/하강)
         //   서로 반대 방향으로 움직이면     -> 롤(좌우 기울기)
-        // 채널별 편향을 만든 뒤 장착 방향에 맞춰 반전한다 (기본: 우측만 반전 —
-        // 거울상 장착). 반전 후에는 피치 = 두 지느러미가 물리적으로 같은 방향,
-        // 롤 = 서로 반대 방향이 된다. 벤치에서 방향이 반대로 보이면 재빌드 없이
-        // ros2 param set /pid_control_node servo_reverse_* 로 뒤집어 확인한다.
-        float d_left  = u_pitch + u_roll;
-        float d_right = u_pitch - u_roll;
+        //
+        // **부호가 두 종류이고 고치는 자리가 다르다 — 섞으면 무한히 헛돈다.**
+        //
+        //   1) 축 부호 (invert_pitch_ / invert_roll_) — 그 축 **하나만** 뒤집는다.
+        //      "피치는 반대인데 롤은 맞다" 는 여기서 고친다.
+        //   2) 서보 반전 (servo_rev_*) — 그 **서보 하나만** 뒤집는다.
+        //      "우측 지느러미만 반대로 간다" 는 여기서 고친다.
+        //
+        //   양쪽 서보를 동시에 반전하는 것은 **축 부호를 둘 다 뒤집는 것과 같다** —
+        //   피치를 고치려고 좌우를 함께 반전하면 롤이 딸려서 뒤집힌다 (2026-09-04
+        //   실기에서 실제로 이 함정에 걸렸다). 축 하나만 문제면 반드시 1) 을 쓴다.
+        //
+        // 2026-08-26 에는 우측만 반전(true)했는데 **물리 확인 없이 PWM 부호로
+        // 추론한** 방향이었고 증상이 그대로였다. 2026-09-04 벤치에서 PID·스틱을
+        // 빼고 /motor/output 에 고정 PWM 을 직접 꽂아 눈으로 확인해 정정했다.
+        // 부호 판정은 반드시 지느러미를 보고 한다 — PWM 부호로 추론하지 말 것.
+        float p_term = invert_pitch_ ? -u_pitch : u_pitch;
+        float r_term = invert_roll_  ? -u_roll  : u_roll;
+        float d_left  = p_term + r_term;
+        float d_right = p_term - r_term;
         float d_yaw_s = u_yaw;
         if (servo_rev_l_) d_left  = -d_left;
         if (servo_rev_r_) d_right = -d_right;
@@ -356,6 +440,9 @@ private:
     float kp_y_, ki_y_, kd_y_;
     float i_limit_;                                          // 적분 누산 한계 (안티 와인드업)
     bool servo_rev_l_, servo_rev_r_, servo_rev_y_;           // 채널별 장착 방향 반전
+    bool invert_pitch_, invert_roll_;                        // 축별 부호 반전 (믹싱 이전)
+    bool swap_rc_rp_;                                        // 수동 스틱 롤<->피치 스왑
+    bool rc_inv_roll_, rc_inv_pitch_;                        // 수동 스틱 부호 반전 (AUTO 제외)
     int  rc_deadband_, throttle_deadband_;                   // 스틱 데드밴드 [카운트]
     float err_sum_roll_, err_sum_pitch_, err_sum_yaw_;       // I항 누산 상태
     float prev_err_roll_, prev_err_pitch_, prev_err_yaw_;    // D항 계산용 직전 오차
